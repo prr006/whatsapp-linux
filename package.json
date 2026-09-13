@@ -9,8 +9,8 @@
   "homepage": "https://github.com/prr006/whatsapp-linux",
   "scripts": {
     "start": "electron .",
-    "build": "electron-builder",
-    "dist": "electron-builder --dir",
+    "dist": "electron-builder",
+    "pack": "electron-builder --dir",
     "test:build": "echo 'Build verification only — run manually with display server'"
   },
   "build": {
