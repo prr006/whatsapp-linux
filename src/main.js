@@ -3,7 +3,8 @@
  * M1 Proof of Concept: loads WhatsApp Web with persistent session.
  */
 
-const { app, BrowserWindow, Tray, Menu, dialog, shell, Notification } = require('electron');
+const { app, BrowserWindow, Tray, Menu, dialog, shell, Notification, ipcMain } = require('electron');
+const fs = require('fs');
 const path = require('path');
 
 // Keep references to avoid GC
@@ -14,6 +15,35 @@ let tray = null;
 const recentNotifications = new Map();
 const NOTIFICATION_DEDUP_WINDOW_MS = 3000;
 let unreadCount = 0;
+
+const DEFAULT_SETTINGS = {
+  closeToTray: true,
+  startWithSystem: false,
+  startMinimized: false,
+  notificationsEnabled: true,
+  notificationPreview: true
+};
+
+function getSettingsPath() {
+  return path.join(app.getPath('userData'), 'settings.json');
+}
+
+function loadSettings() {
+  try {
+    const data = fs.readFileSync(getSettingsPath(), 'utf8');
+    return Object.assign({}, DEFAULT_SETTINGS, JSON.parse(data));
+  } catch (e) {
+    return Object.assign({}, DEFAULT_SETTINGS);
+  }
+}
+
+function saveSettings(s) {
+  try {
+    fs.writeFileSync(getSettingsPath(), JSON.stringify(s, null, 2));
+  } catch (e) {
+    console.error('Failed to save settings:', e);
+  }
+}
 function isDuplicate(key) {
   const now = Date.now();
   const last = recentNotifications.get(key);
@@ -88,9 +118,14 @@ function createWindow () {
   });
 
   // Show when ready to reduce visual flicker
+  const settings = loadSettings();
   mainWindow.once('ready-to-show', () => {
-    mainWindow.show();
-    mainWindow.focus();
+    if (settings.startMinimized) {
+      mainWindow.hide();
+    } else {
+      mainWindow.show();
+      mainWindow.focus();
+    }
   });
 
   // Handle external links gracefully (open in default browser)
@@ -109,9 +144,12 @@ function createWindow () {
 
   // M2 fix: close-to-tray — prevent window destruction on X, hide instead
   mainWindow.on('close', (e) => {
-    e.preventDefault();
-    mainWindow.hide();
-    console.log('Window hidden to tray (close prevented)');
+    const s = loadSettings();
+    if (s.closeToTray) {
+      e.preventDefault();
+      mainWindow.hide();
+      console.log('Window hidden to tray (close prevented)');
+    }
   });
 
   // Window actually destroyed (e.g., app quit), clean up reference
@@ -146,32 +184,41 @@ function createWindow () {
       return;
     }
 
-    // Only show native notification; keep it lightweight/non-blocking
-    const nativeNotif = new Notification({
-      title: title,
-      body: body,
-      icon: iconPath,
-      hasReply: false,
-      silent: false
-    });
-
-    nativeNotif.on('click', () => {
-      if (mainWindow) {
-        if (mainWindow.isMinimized()) mainWindow.restore();
-        mainWindow.show();
-        mainWindow.focus();
-      }
-    });
-
-    unreadCount++;
-    updateUnreadIndicator();
-    // If user is already focused, don't leave false unread indicator
-    if (mainWindow && mainWindow.isFocused()) {
-      unreadCount = 0;
+    const s = loadSettings();
+    if (s.notificationsEnabled) {
+      unreadCount++;
       updateUnreadIndicator();
+      if (mainWindow && mainWindow.isFocused()) {
+        unreadCount = 0;
+        updateUnreadIndicator();
+      }
+      const previewBody = s.notificationPreview ? body : '';
+      const nativeNotif = new Notification({
+        title: title,
+        body: previewBody,
+        icon: iconPath,
+        hasReply: false,
+        silent: false
+      });
+      nativeNotif.on('click', () => {
+        if (mainWindow) {
+          if (mainWindow.isMinimized()) mainWindow.restore();
+          mainWindow.show();
+          mainWindow.focus();
+        }
+      });
+      nativeNotif.show();
+      console.log('Native notification shown:', title, '| unread=', unreadCount);
+    } else {
+      // Notifications disabled: don't show native, but still count for unread if message arrives
+      unreadCount++;
+      updateUnreadIndicator();
+      if (mainWindow && mainWindow.isFocused()) {
+        unreadCount = 0;
+        updateUnreadIndicator();
+      }
+      console.log('Notification suppressed (disabled by setting):', title);
     }
-    nativeNotif.show();
-    console.log('Native notification shown:', title, '|', body.substring(0, 60), '| unread=', unreadCount);
   });
 
   // M3: reset unread when user returns to app
@@ -191,6 +238,52 @@ function createWindow () {
   });
 }
 
+function createSettingsWindow () {
+  const settingsWindow = new BrowserWindow({
+    width: 500,
+    height: 420,
+    resizable: false,
+    minimizable: false,
+    maximizable: false,
+    title: 'WhatsApp for Linux — Settings',
+    icon: path.join(__dirname, '..', 'build', 'icons', 'icon.png'),
+    webPreferences: {
+      nodeIntegration: false,
+      contextIsolation: true,
+      preload: path.join(__dirname, 'preload-settings.js')
+    },
+    show: false,
+    backgroundColor: '#111b21'
+  });
+  settingsWindow.loadFile(path.join(__dirname, 'settings.html'));
+  settingsWindow.once('ready-to-show', () => {
+    settingsWindow.show();
+    settingsWindow.focus();
+  });
+  settingsWindow.on('closed', () => {
+    // clean reference if needed; not critical
+  });
+}
+
+
+// M4: Settings IPC
+ipcMain.handle('get-settings', () => loadSettings());
+ipcMain.handle('set-settings', (event, settings) => {
+  saveSettings(settings);
+  applySettings(settings);
+  return true;
+});
+
+function applySettings(s) {
+  // Apply close-to-tray immediately
+  // Apply notification toggle immediately (handled in notification handler via loadSettings)
+  // Apply start minimized for future restarts
+  if (mainWindow && s.startMinimized && mainWindow.isVisible()) {
+    // If already visible and user sets startMinimized, don't hide immediately
+  }
+  console.log('Settings applied:', s);
+}
+
 function createTray () {
   // Use a simple icon for tray; fall back to app icon if needed
   const iconPath = path.join(__dirname, '..', 'build', 'icons', 'icon.png');
@@ -208,6 +301,12 @@ function createTray () {
         } else {
           createWindow();
         }
+      }
+    },
+    {
+      label: 'Settings',
+      click: () => {
+        createSettingsWindow();
       }
     },
     {
