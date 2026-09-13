@@ -7,6 +7,7 @@ ICON_SRC="build/icons/icon.png"
 DESKTOP_SRC="build/whatsapp-linux.desktop"
 
 # Install icon to user theme directory (required for .desktop Icon=whatsapp-linux)
+mkdir -p ~/.local/share/applications
 mkdir -p ~/.local/share/icons/hicolor/256x256/apps
 mkdir -p ~/.local/share/icons/hicolor/48x48/apps
 cp "$ICON_SRC" ~/.local/share/icons/hicolor/256x256/apps/whatsapp-linux.png
