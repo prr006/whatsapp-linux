@@ -13,6 +13,7 @@ let tray = null;
 // M2: lightweight dedup tracker for native notifications
 const recentNotifications = new Map();
 const NOTIFICATION_DEDUP_WINDOW_MS = 3000;
+let unreadCount = 0;
 function isDuplicate(key) {
   const now = Date.now();
   const last = recentNotifications.get(key);
@@ -27,6 +28,23 @@ function isDuplicate(key) {
     }
   }
   return false;
+}
+
+
+function updateUnreadIndicator() {
+  if (!tray) return;
+  const badgePath = path.join(__dirname, '..', 'build', 'icons', 'icon-badge.png');
+  if (unreadCount > 0) {
+    tray.setToolTip('WhatsApp — ' + unreadCount + ' unread');
+    if (mainWindow) {
+      try { mainWindow.setOverlayIcon(badgePath); } catch (e) { /* overlay not critical */ }
+    }
+  } else {
+    tray.setToolTip('WhatsApp for Linux');
+    if (mainWindow) {
+      try { mainWindow.setOverlayIcon(null); } catch (e) { /* overlay not critical */ }
+    }
+  }
 }
 
 // Lock to single instance
@@ -145,8 +163,31 @@ function createWindow () {
       }
     });
 
+    unreadCount++;
+    updateUnreadIndicator();
+    // If user is already focused, don't leave false unread indicator
+    if (mainWindow && mainWindow.isFocused()) {
+      unreadCount = 0;
+      updateUnreadIndicator();
+    }
     nativeNotif.show();
-    console.log('Native notification shown:', title, '|', body.substring(0, 60));
+    console.log('Native notification shown:', title, '|', body.substring(0, 60), '| unread=', unreadCount);
+  });
+
+  // M3: reset unread when user returns to app
+  mainWindow.on('focus', () => {
+    if (unreadCount > 0) {
+      unreadCount = 0;
+      updateUnreadIndicator();
+      console.log('Unread cleared (focus)');
+    }
+  });
+  mainWindow.on('show', () => {
+    if (unreadCount > 0) {
+      unreadCount = 0;
+      updateUnreadIndicator();
+      console.log('Unread cleared (show from tray)');
+    }
   });
 }
 
