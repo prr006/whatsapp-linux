@@ -65,7 +65,7 @@ function isDuplicate(key) {
 
 function updateUnreadIndicator() {
   if (!tray) return;
-  const badgePath = path.join(__dirname, '..', 'build', 'icons', 'icon-badge.png');
+  const badgePath = path.join(app.getAppPath(), 'build', 'icons', 'icon-badge.png');
   if (unreadCount > 0) {
     tray.setToolTip('WhatsApp — ' + unreadCount + ' unread');
     if (mainWindow) {
@@ -100,7 +100,7 @@ function createWindow () {
     minWidth: 900,
     minHeight: 600,
     title: 'WhatsApp for Linux',
-    icon: path.join(__dirname, '..', 'build', 'icons', 'icon.png'),
+    icon: path.join(app.getAppPath(), 'build', 'icons', 'icon.png'),
     webPreferences: {
       // Minimal safe settings; no node integration exposed
       nodeIntegration: false,
@@ -177,7 +177,7 @@ function createWindow () {
 
     const title = notification.title || 'WhatsApp';
     const body = notification.body || '';
-    const iconPath = path.join(__dirname, '..', 'build', 'icons', 'icon.png');
+    const iconPath = path.join(app.getAppPath(), 'build', 'icons', 'icon.png');
 
     // Dedup key: title + first 50 chars of body
     const dedupKey = title + '|' + body.substring(0, 50);
@@ -248,7 +248,7 @@ function createSettingsWindow () {
     minimizable: false,
     maximizable: false,
     title: 'WhatsApp for Linux — Settings',
-    icon: path.join(__dirname, '..', 'build', 'icons', 'icon.png'),
+    icon: path.join(app.getAppPath(), 'build', 'icons', 'icon.png'),
     webPreferences: {
       nodeIntegration: false,
       contextIsolation: true,
@@ -288,7 +288,7 @@ function applySettings(s) {
 
 function createTray () {
   // Use a simple icon for tray; fall back to app icon if needed
-  const iconPath = path.join(__dirname, '..', 'build', 'icons', 'icon.png');
+  const iconPath = path.join(app.getAppPath(), 'build', 'icons', 'icon.png');
   tray = new Tray(iconPath);
   tray.setToolTip('WhatsApp for Linux');
 
