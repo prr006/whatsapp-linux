@@ -5,6 +5,8 @@
 
 const { app, BrowserWindow, Tray, Menu, dialog, shell, Notification, ipcMain } = require('electron');
 const fs = require('fs');
+
+app.setName('whatsapp-linux');
 const path = require('path');
 
 // Keep references to avoid GC
