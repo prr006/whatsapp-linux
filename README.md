@@ -76,10 +76,13 @@ performance changes** (analysis and any optimisation come after data exists).
 | 9 | `first meaningful UI ready` | user can actually use WhatsApp |
 
 Point 9 is detected with a **read-only probe** (no DOM injection / CSS / JS
-overrides — the M1 principle stays intact): after `dom-ready`, every 500 ms
-the renderer is asked whether `#side` (chat list, logged-in session) or
-`.qr-code` (login screen) exists; the first match is logged as
-`first meaningful UI ready (chat-list | qr-code)`.
+overrides — the M1 principle stays intact): after `dom-ready` (with
+`did-finish-load` as a fallback trigger — packaged runs were observed to
+deliver the latter without the former), every 500 ms the renderer is asked
+whether any known usable element exists — `#side`, `#pane-side` or
+`[data-testid="chat-list"]` (logged-in session), `[data-testid="qrcode"]`,
+`.qr-code` or `canvas[aria-label]` (login screen); the first match is logged
+as `first meaningful UI ready (chat-list | qr-code)`.
 
 ### Running the measurement
 

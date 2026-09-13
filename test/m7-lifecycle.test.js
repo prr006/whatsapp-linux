@@ -307,6 +307,50 @@ test('startup instrumentation: dom-ready, ready-to-show, did-finish-load and fir
     1, 'UI-ready logged exactly once');
 });
 
+test('startup instrumentation: did-finish-load (re)starts the UI probe when dom-ready was missed (packaged regression)', async () => {
+  const { __perfEvents } = require(path.join(__dirname, '..', 'src', 'main.js'));
+
+  // Simulate the packaged failure mode: the renderer already shows usable UI
+  // but 'dom-ready' was never delivered, so the probe is idle. did-finish-load
+  // (which demonstrably fires in those runs) must start the probe on its own.
+  let probes = 0;
+  win.webContents.executeJavaScript = async () => {
+    probes += 1;
+    return 'chat-list';
+  };
+
+  const uiReadyBefore = __perfEvents.filter(
+    (e) => e.label.startsWith('first meaningful UI ready')).length;
+  win.webContents.__emit('did-finish-load'); // fallback trigger, no dom-ready
+  const deadline = Date.now() + 4000;
+  while (Date.now() < deadline &&
+         __perfEvents.filter(
+           (e) => e.label.startsWith('first meaningful UI ready')).length === uiReadyBefore) {
+    await sleep(100);
+  }
+  assert.ok(probes >= 1, 'fallback probe polled the renderer after did-finish-load');
+  assert.strictEqual(
+    __perfEvents.filter((e) => e.label.startsWith('first meaningful UI ready')).length,
+    uiReadyBefore + 1, 'fallback run records usable exactly once more');
+});
+
+test('startup instrumentation: UI-ready probe matches logged-in and login selectors', () => {
+  const { __uiReadyProbe } = require(path.join(__dirname, '..', 'src', 'main.js'));
+  assert.ok(typeof __uiReadyProbe === 'string' && __uiReadyProbe.length > 0,
+    'probe source exported for testing');
+  const runProbe = (present) => {
+    const document = { querySelector: (sel) => (present.includes(sel) ? {} : null) };
+    return new Function('document', 'return ' + __uiReadyProbe)(document);
+  };
+  assert.strictEqual(runProbe(['#side']), 'chat-list');
+  assert.strictEqual(runProbe(['#pane-side']), 'chat-list');
+  assert.strictEqual(runProbe(['[data-testid="chat-list"]']), 'chat-list');
+  assert.strictEqual(runProbe(['[data-testid="qrcode"]']), 'qr-code');
+  assert.strictEqual(runProbe(['.qr-code']), 'qr-code');
+  assert.strictEqual(runProbe(['canvas[aria-label]']), 'qr-code');
+  assert.strictEqual(runProbe([]), null, 'loading screen matches nothing');
+});
+
 // Must run LAST: sets isQuitting=true via the before-quit path.
 test('tray Quit: before-quit lets the window close (regression guard)', () => {
   const quitItem = electronMock.__menuTemplate.find((i) => i.label === 'Quit');

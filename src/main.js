@@ -193,15 +193,22 @@ if (!gotTheLock) {
 //
 // Read-only probe — the M1 principle (no DOM injection, no CSS, no JS
 // overrides) stays intact: nothing is written into the page. We only ask the
-// renderer whether one of two long-standing stable selectors exists:
-//   #side    -> chat list sidebar (existing, logged-in session)
-//   .qr-code -> QR container on the login screen (fresh session)
-// Either one is the point at which the user can actually use WhatsApp, so it
-// is the "usable" timestamp for cold-start measurement.
+// renderer whether any known "usable" element exists:
+//   logged-in session: #side, #pane-side, [data-testid="chat-list"]
+//   fresh session:     [data-testid="qrcode"], .qr-code, canvas[aria-label]
+// Either side is the point at which the user can actually use WhatsApp, so
+// the first match is the "usable" timestamp for cold-start measurement.
+// Multiple selectors per side: a single WhatsApp DOM rename must not silently
+// break the measurement (M8 measurement fix — the old single selectors
+// #side / .qr-code no longer cover the real page on their own).
 const UI_READY_PROBE = [
   '(function () {',
-  "  if (document.querySelector('#side')) return 'chat-list';",
-  "  if (document.querySelector('.qr-code')) return 'qr-code';",
+  "  if (document.querySelector('#side') ||",
+  "      document.querySelector('#pane-side') ||",
+  '      document.querySelector(\'[data-testid="chat-list"]\')) return \'chat-list\';',
+  '  if (document.querySelector(\'[data-testid="qrcode"]\') ||',
+  "      document.querySelector('.qr-code') ||",
+  "      document.querySelector('canvas[aria-label]')) return 'qr-code';",
   '  return null;',
   '})()'
 ].join('\n');
@@ -299,7 +306,9 @@ function createWindow () {
   });
 
   // M8: DOM-level load stage, and start the read-only first-meaningful-UI
-  // probe (see UI_READY_PROBE above).
+  // probe (see UI_READY_PROBE above). Primary trigger; did-finish-load below
+  // re-starts the (idempotent) probe as a fallback for runs where dom-ready
+  // is never delivered (observed in packaged runs).
   mainWindow.webContents.on('dom-ready', () => {
     perfLog('dom-ready');
     startFirstUIReadyProbe();
@@ -332,6 +341,14 @@ function createWindow () {
   mainWindow.webContents.on('did-finish-load', () => {
     perfLog('did-finish-load (WhatsApp Web loaded)');
     console.log('Page loaded successfully');
+    // M8 measurement fix: fallback probe start. Packaged runs were observed
+    // to log did-finish-load (and ready-to-show) without ever logging
+    // dom-ready, which left the first-meaningful-UI probe idle and the run
+    // stuck at "USABLE NOT REACHED". did-finish-load demonstrably fires in
+    // those runs, so (re)start the probe here too. startFirstUIReadyProbe is
+    // idempotent, so the normal dom-ready-first path is unchanged: no extra
+    // polling, no startup behaviour change — measurement only.
+    startFirstUIReadyProbe();
   });
 
   // M7: Native Linux desktop notifications via Electron Notification API.
@@ -551,5 +568,6 @@ app.on('before-quit', () => {
 // (test/m7-lifecycle.test.js). Electron ignores main-process exports.
 module.exports = {
   __perfStartMs: PERF_START_MS,
-  __perfEvents: PERF_EVENTS
+  __perfEvents: PERF_EVENTS,
+  __uiReadyProbe: UI_READY_PROBE
 };

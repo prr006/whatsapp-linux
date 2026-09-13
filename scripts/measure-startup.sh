@@ -251,10 +251,15 @@ for run_no in $(seq 1 "$RUNS"); do
 
   USABLE=0
   if wait_usable "$LOG"; then USABLE=1; fi
-  STOPPED_AT=$(date +%s%3N)
+  # M8 measurement fix: STOPPED_AT used to be stamped here — before the app
+  # was actually stopped — so "wall clock to stop" really measured "time to
+  # usable-line/early-exit/timeout". Keep that instant under its true name and
+  # stamp the stop time only after stop_app returns.
+  DETECTED_AT=$(date +%s%3N)
 
   stop_app
   APP_PID=""
+  STOPPED_AT=$(date +%s%3N)
 
   ROWS="$(perf_rows "$LOG")"
   if [ -z "$ROWS" ]; then
@@ -294,6 +299,7 @@ for run_no in $(seq 1 "$RUNS"); do
   else
     printf '    USABLE (first UI ready) : NOT REACHED in %ss\n' "$TIMEOUT"
   fi
+  printf '    (wall clock to detection : %7dms)\n' $((DETECTED_AT - T0))
   printf '    (wall clock to stop      : %7dms)\n' $((STOPPED_AT - T0))
 done
 
