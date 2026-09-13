@@ -3,11 +3,59 @@
  * M1 Proof of Concept: loads WhatsApp Web with persistent session.
  */
 
-const { app, BrowserWindow, Tray, Menu, dialog, shell, Notification, ipcMain } = require('electron');
+const { app, BrowserWindow, Tray, Menu, dialog, shell, Notification, ipcMain, nativeImage } = require('electron');
 const fs = require('fs');
 
 app.setName('whatsapp-linux');
 const path = require('path');
+
+/**
+ * Resolve a runtime icon that native APIs (Tray, Notification) can load.
+ *
+ * Packaged Electron cannot feed asar paths to native image loaders:
+ *   app.getAppPath() -> .../resources/app.asar
+ *   .../app.asar/build/icons/icon.png  <-- native Tray fails
+ *
+ * extraResources copies the icon outside asar:
+ *   process.resourcesPath/icons/icon.png
+ */
+function getRuntimeIconFile(filename) {
+  if (app.isPackaged) {
+    return path.join(process.resourcesPath, 'icons', filename);
+  }
+  return path.join(__dirname, '..', 'build', 'icons', filename);
+}
+
+function loadNativeIcon(filename) {
+  const filePath = getRuntimeIconFile(filename);
+
+  try {
+    if (fs.existsSync(filePath)) {
+      const fromPath = nativeImage.createFromPath(filePath);
+      if (!fromPath.isEmpty()) {
+        return { image: fromPath, filePath };
+      }
+    }
+  } catch (err) {
+    console.error('nativeImage.createFromPath failed:', filePath, err);
+  }
+
+  // Node fs is asar-aware; native path loading is not. Use this only as fallback.
+  const asarFallback = path.join(__dirname, '..', 'build', 'icons', filename);
+  try {
+    const buf = fs.readFileSync(asarFallback);
+    const fromBuffer = nativeImage.createFromBuffer(buf);
+    if (!fromBuffer.isEmpty()) {
+      console.warn('Loaded icon from asar buffer fallback:', asarFallback);
+      return { image: fromBuffer, filePath: asarFallback };
+    }
+  } catch (err) {
+    console.error('Failed to read icon buffer:', asarFallback, err);
+  }
+
+  console.error('Icon missing or invalid:', filePath);
+  return { image: nativeImage.createEmpty(), filePath };
+}
 
 // Keep references to avoid GC
 let mainWindow = null;
@@ -65,7 +113,7 @@ function isDuplicate(key) {
 
 function updateUnreadIndicator() {
   if (!tray) return;
-  const badgePath = path.join(app.getAppPath(), 'build', 'icons', 'icon-badge.png');
+  const badgePath = getRuntimeIconFile('icon-badge.png');
   if (unreadCount > 0) {
     tray.setToolTip('WhatsApp — ' + unreadCount + ' unread');
     if (mainWindow) {
@@ -100,7 +148,7 @@ function createWindow () {
     minWidth: 900,
     minHeight: 600,
     title: 'WhatsApp for Linux',
-    icon: path.join(app.getAppPath(), 'build', 'icons', 'icon.png'),
+    icon: getRuntimeIconFile('icon.png'),
     webPreferences: {
       // Minimal safe settings; no node integration exposed
       nodeIntegration: false,
@@ -177,7 +225,7 @@ function createWindow () {
 
     const title = notification.title || 'WhatsApp';
     const body = notification.body || '';
-    const iconPath = path.join(app.getAppPath(), 'build', 'icons', 'icon.png');
+    const iconPath = getRuntimeIconFile('icon.png');
 
     // Dedup key: title + first 50 chars of body
     const dedupKey = title + '|' + body.substring(0, 50);
@@ -248,7 +296,7 @@ function createSettingsWindow () {
     minimizable: false,
     maximizable: false,
     title: 'WhatsApp for Linux — Settings',
-    icon: path.join(app.getAppPath(), 'build', 'icons', 'icon.png'),
+    icon: getRuntimeIconFile('icon.png'),
     webPreferences: {
       nodeIntegration: false,
       contextIsolation: true,
@@ -287,9 +335,12 @@ function applySettings(s) {
 }
 
 function createTray () {
-  // Use a simple icon for tray; fall back to app icon if needed
-  const iconPath = path.join(app.getAppPath(), 'build', 'icons', 'icon.png');
-  tray = new Tray(iconPath);
+  const { image, filePath } = loadNativeIcon('icon.png');
+  if (image.isEmpty()) {
+    throw new Error('Failed to load tray icon from path \'' + filePath + '\'');
+  }
+
+  tray = new Tray(image);
   tray.setToolTip('WhatsApp for Linux');
 
   const contextMenu = Menu.buildFromTemplate([
@@ -334,7 +385,12 @@ function createTray () {
 
 app.whenReady().then(() => {
   createWindow();
-  createTray();
+  try {
+    createTray();
+  } catch (err) {
+    tray = null;
+    console.error('Tray initialization failed:', err && err.message ? err.message : err);
+  }
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) {
@@ -344,6 +400,8 @@ app.whenReady().then(() => {
       mainWindow.focus();
     }
   });
+}).catch((err) => {
+  console.error('App ready failed:', err && err.message ? err.message : err);
 });
 
 app.on('window-all-closed', () => {

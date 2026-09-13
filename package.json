@@ -42,7 +42,14 @@
       "build/**/*"
     ],
     "extraResources": [
-      "build/icons/icon.png"
+      {
+        "from": "build/icons/icon.png",
+        "to": "icons/icon.png"
+      },
+      {
+        "from": "build/icons/icon-badge.png",
+        "to": "icons/icon-badge.png"
+      }
     ]
   },
   "devDependencies": {
