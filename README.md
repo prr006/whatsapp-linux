@@ -27,6 +27,31 @@ A polished, lightweight Linux desktop client around the official WhatsApp Web ex
 - M2 (after approval): Notifications, unread badges, drag/drop, keyboard shortcuts, settings.
 - M3: Full tray/menu integration, close-to-tray, start minimized, packaging.
 - M4 (optional): Voice/video calls, app lock, updater.
+- **M7 (current): Startup + notification UX polish** — see below.
+
+## M7 — Startup & Notification UX
+- **Notifications** (see `webContents.on('notification')` in `src/main.js`):
+  - Banners only appear when the app is **not** already focused.
+  - Banners auto-dismiss after a bounded ~5 s (`NOTIFICATION_TIMEOUT_MS`), for
+    daemons that otherwise keep them up indefinitely.
+  - Clicking a banner dismisses it and restores/focuses the **same** window
+    (single-instance lock guarantees no second process).
+  - Duplicate suppression is preserved.
+  - Notifications are disabled gracefully by the existing settings toggle.
+- **Startup / resume**:
+  - A genuine quit (`before-quit` → `isQuitting`) now lets the window close,
+    so tray "Quit" is no longer blocked by the close-to-tray handler.
+  - Every activation path (tray, notification click, second instance, macOS
+    `activate`) routes through one `showAndFocusMainWindow()` helper that
+    reuses the existing BrowserWindow/webContents — the WhatsApp Web instance
+    is never destroyed or reloaded while hidden in the tray.
+  - `[perf]` log lines timestamp main-process start → `BrowserWindow created` →
+    `ready-to-show` → `did-finish-load` → `tray created`, and log tray-resume
+    restores, so cold-start and resume cost can be measured on a real machine.
+- **Tests**: `npm test` runs `test/m7-lifecycle.test.js` (mocked Electron,
+  no display needed) covering close-to-tray, focused/hidden notification
+  behaviour, auto-dismiss, click-to-restore, dedup, disabled toggle,
+  single-instance, and quit-cascade.
 
 ## Directory Structure
 ```

@@ -19,6 +19,7 @@
     "start": "electron .",
     "dist": "electron-builder",
     "pack": "electron-builder --dir",
+    "test": "node --test test/m7-lifecycle.test.js",
     "test:build": "echo 'Build verification only — run manually with display server'"
   },
   "build": {

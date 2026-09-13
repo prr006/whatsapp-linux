@@ -9,6 +9,15 @@ const fs = require('fs');
 app.setName('whatsapp-linux');
 const path = require('path');
 
+// M7: startup/resume timing instrumentation (cheap, consistent with existing
+// console logging). Logs elapsed ms since main-process start at key lifecycle
+// points so cold-start and tray-resume cost can be measured on a real machine.
+const PERF_START_MS = Date.now();
+function perfLog(label) {
+  console.log(`[perf] ${label}  (+${Date.now() - PERF_START_MS}ms)`);
+}
+perfLog('main process started');
+
 /**
  * Resolve a runtime icon that native APIs (Tray, Notification) can load.
  *
@@ -66,6 +75,15 @@ const recentNotifications = new Map();
 const NOTIFICATION_DEDUP_WINDOW_MS = 3000;
 let unreadCount = 0;
 
+// M7: bounded auto-dismiss for native notifications. Some Linux notification
+// daemons keep banners up indefinitely when no expiry is specified; we enforce
+// a short window so behaviour is consistent with a polished desktop UX.
+const NOTIFICATION_TIMEOUT_MS = 5000;
+
+// M7: set true once the app is genuinely quitting so the close-to-tray handler
+// does not intercept the final window close (which would abort the quit).
+let isQuitting = false;
+
 const DEFAULT_SETTINGS = {
   closeToTray: true,
   startWithSystem: false,
@@ -110,6 +128,30 @@ function isDuplicate(key) {
   return false;
 }
 
+// M7: single place that restores + shows + focuses the main window. Used by
+// notification clicks, the tray "Show WhatsApp" item, second-instance and
+// activate, so every path reuses the SAME window/WebView instead of recreating
+// WhatsApp Web (requirement: no unnecessary reloads, near-instant resume).
+function showAndFocusMainWindow() {
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    createWindow();
+    return;
+  }
+  const wasVisible = mainWindow.isVisible();
+  if (mainWindow.isMinimized()) mainWindow.restore();
+  mainWindow.show();
+  mainWindow.focus();
+  if (!wasVisible) {
+    perfLog('resume: restored hidden window');
+  }
+}
+
+// M7: true when the user is actively looking at the window. A notification
+// banner is redundant on top of a chat the user can already see.
+function isMainWindowFocused() {
+  return !!(mainWindow && !mainWindow.isDestroyed() && mainWindow.isFocused());
+}
+
 
 function updateUnreadIndicator() {
   if (!tray) return;
@@ -133,10 +175,10 @@ if (!gotTheLock) {
   app.quit();
 } else {
   app.on('second-instance', (event, argv, workingDirectory) => {
-    if (mainWindow) {
-      if (mainWindow.isMinimized()) mainWindow.restore();
-      mainWindow.focus();
-    }
+    // Reuse the existing window (also works when hidden to tray) instead of
+    // creating a second one. Single-instance lock already guarantees only one
+    // process exists.
+    showAndFocusMainWindow();
   });
 }
 
@@ -161,6 +203,7 @@ function createWindow () {
     show: false,
     backgroundColor: '#111b21'
   });
+  perfLog('BrowserWindow created');
 
   // Load WhatsApp Web directly — NO DOM injection, NO custom CSS per principles
   mainWindow.loadURL('https://web.whatsapp.com', {
@@ -170,6 +213,7 @@ function createWindow () {
   // Show when ready to reduce visual flicker
   const settings = loadSettings();
   mainWindow.once('ready-to-show', () => {
+    perfLog('ready-to-show');
     if (settings.startMinimized) {
       mainWindow.hide();
     } else {
@@ -192,10 +236,13 @@ function createWindow () {
     console.error('Load failed:', validatedURL, errorCode, errorDescription);
   });
 
-  // M2 fix: close-to-tray — prevent window destruction on X, hide instead
+  // M2 fix: close-to-tray — prevent window destruction on X, hide instead.
+  // M7: during a real quit (isQuitting) the window must be allowed to close,
+  // otherwise app.quit() would be aborted by the very handler meant to keep
+  // the app alive in the tray.
   mainWindow.on('close', (e) => {
     const s = loadSettings();
-    if (s.closeToTray) {
+    if (s.closeToTray && !isQuitting) {
       e.preventDefault();
       mainWindow.hide();
       console.log('Window hidden to tray (close prevented)');
@@ -213,62 +260,77 @@ function createWindow () {
   });
 
   mainWindow.webContents.on('did-finish-load', () => {
+    perfLog('did-finish-load (WhatsApp Web loaded)');
     console.log('Page loaded successfully');
   });
 
-  // M2: Native Linux desktop notifications via Electron Notification API
-  // We listen to WhatsApp Web's standard web Notification events and
-  // replace them with native notifications to work when hidden/minimized.
-  mainWindow.webContents.on('notification', (event, notification, actions) => {
-    // Prevent the default web notification from also showing (avoid duplicates)
+  // M7: Native Linux desktop notifications via Electron Notification API.
+  // We listen to WhatsApp Web's standard web Notification events and replace
+  // them with controlled native notifications so they:
+  //   - only appear when the user is NOT already looking at the chat,
+  //   - auto-dismiss after a short bounded time (NOTIFICATION_TIMEOUT_MS),
+  //   - restore/focus the SAME window on click (single-instance guarantees no
+  //     second process is created),
+  //   - are deduplicated (isDuplicate), and
+  //   - are removed after a click (nativeNotif.close()).
+  mainWindow.webContents.on('notification', (event, notification) => {
+    // Prevent Chromium's own rendering of the web notification (avoid duplicates).
     event.preventDefault();
+
+    // User is already looking at the app: no banner, no unread bump.
+    if (isMainWindowFocused()) {
+      return;
+    }
 
     const title = notification.title || 'WhatsApp';
     const body = notification.body || '';
-    const iconPath = getRuntimeIconFile('icon.png');
 
-    // Dedup key: title + first 50 chars of body
+    // Dedup key: title + first 50 chars of body.
     const dedupKey = title + '|' + body.substring(0, 50);
     if (isDuplicate(dedupKey)) {
       console.log('Notification suppressed (duplicate):', title);
       return;
     }
 
+    // Count as unread regardless of the notification toggle (keeps M2/M3
+    // tray badge/tooltip behaviour intact even when banners are disabled).
+    unreadCount++;
+    updateUnreadIndicator();
+
     const s = loadSettings();
-    if (s.notificationsEnabled) {
-      unreadCount++;
-      updateUnreadIndicator();
-      if (mainWindow && mainWindow.isFocused()) {
-        unreadCount = 0;
-        updateUnreadIndicator();
-      }
-      const previewBody = s.notificationPreview ? body : '';
-      const nativeNotif = new Notification({
-        title: title,
-        body: previewBody,
-        icon: iconPath,
-        hasReply: false,
-        silent: false
-      });
-      nativeNotif.on('click', () => {
-        if (mainWindow) {
-          if (mainWindow.isMinimized()) mainWindow.restore();
-          mainWindow.show();
-          mainWindow.focus();
-        }
-      });
-      nativeNotif.show();
-      console.log('Native notification shown:', title, '| unread=', unreadCount);
-    } else {
-      // Notifications disabled: don't show native, but still count for unread if message arrives
-      unreadCount++;
-      updateUnreadIndicator();
-      if (mainWindow && mainWindow.isFocused()) {
-        unreadCount = 0;
-        updateUnreadIndicator();
-      }
-      console.log('Notification suppressed (disabled by setting):', title);
+    if (!s.notificationsEnabled) {
+      console.log('Notification suppressed (disabled by setting):', title, '| unread=', unreadCount);
+      return;
     }
+
+    const nativeNotif = new Notification({
+      title: title,
+      body: s.notificationPreview ? body : '',
+      icon: getRuntimeIconFile('icon.png'),
+      silent: false
+    });
+
+    // Click -> dismiss the banner and restore/focus the existing window.
+    nativeNotif.on('click', () => {
+      nativeNotif.close();
+      showAndFocusMainWindow();
+    });
+
+    // Surface daemon delivery problems instead of failing silently.
+    nativeNotif.on('failed', (ev, error) => {
+      console.error('Native notification failed to display:', error);
+    });
+
+    nativeNotif.show();
+
+    // Bounded auto-dismiss (~5s). On daemons that already honour a short
+    // default expiry this is a harmless no-op; on daemons that keep banners
+    // up indefinitely it enforces the requirement.
+    setTimeout(() => {
+      try { nativeNotif.close(); } catch (e) { /* already gone */ }
+    }, NOTIFICATION_TIMEOUT_MS);
+
+    console.log('Native notification shown:', title, '| unread=', unreadCount);
   });
 
   // M3: reset unread when user returns to app
@@ -347,13 +409,7 @@ function createTray () {
     {
       label: 'Show WhatsApp',
       click: () => {
-        if (mainWindow) {
-          if (mainWindow.isMinimized()) mainWindow.restore();
-          mainWindow.show();
-          mainWindow.focus();
-        } else {
-          createWindow();
-        }
+        showAndFocusMainWindow();
       }
     },
     {
@@ -376,14 +432,17 @@ function createTray () {
       if (mainWindow.isVisible()) {
         mainWindow.hide();
       } else {
+        if (mainWindow.isMinimized()) mainWindow.restore();
         mainWindow.show();
         mainWindow.focus();
       }
     }
   });
+  perfLog('tray created');
 }
 
 app.whenReady().then(() => {
+  perfLog('app ready');
   createWindow();
   try {
     createTray();
@@ -392,13 +451,10 @@ app.whenReady().then(() => {
     console.error('Tray initialization failed:', err && err.message ? err.message : err);
   }
 
+  // M7: reuse the single helper so every activation path restores the same
+  // window (createWindow() is called lazily only if it no longer exists).
   app.on('activate', () => {
-    if (BrowserWindow.getAllWindows().length === 0) {
-      createWindow();
-    } else if (mainWindow) {
-      mainWindow.show();
-      mainWindow.focus();
-    }
+    showAndFocusMainWindow();
   });
 }).catch((err) => {
   console.error('App ready failed:', err && err.message ? err.message : err);
@@ -414,6 +470,8 @@ app.on('window-all-closed', () => {
 });
 
 app.on('before-quit', () => {
+  // M7: mark a genuine quit so the close-to-tray handler lets the window close.
+  isQuitting = true;
   // Clean log before exit
   console.log('WhatsApp for Linux shutting down');
 });
