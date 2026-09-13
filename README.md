@@ -2,7 +2,7 @@
 
 A polished, lightweight Linux desktop client around the official WhatsApp Web experience.
 
-> **Status:** M1 Proof of Concept — architecture validated, Electron binary download blocked by sandbox network restrictions. Code verified via syntax check and dry-run test.
+> **Status:** M8 (current) — startup profiling / cold-start measurement, building on the merged M7 (startup + notification UX). Verified on a real machine: packaged app takes roughly **4–5 s until WhatsApp is usable**, while the tray appears in roughly **1–2 s**.
 
 ## Project Goals (from specification)
 - WhatsApp Web login via QR
@@ -27,7 +27,8 @@ A polished, lightweight Linux desktop client around the official WhatsApp Web ex
 - M2 (after approval): Notifications, unread badges, drag/drop, keyboard shortcuts, settings.
 - M3: Full tray/menu integration, close-to-tray, start minimized, packaging.
 - M4 (optional): Voice/video calls, app lock, updater.
-- **M7 (current): Startup + notification UX polish** — see below.
+- M7 (merged): Startup + notification UX polish — see below.
+- **M8 (current): Startup profiling / cold-start measurement** — see below.
 
 ## M7 — Startup & Notification UX
 - **Notifications** (see `webContents.on('notification')` in `src/main.js`):
@@ -48,22 +49,107 @@ A polished, lightweight Linux desktop client around the official WhatsApp Web ex
   - `[perf]` log lines timestamp main-process start → `BrowserWindow created` →
     `ready-to-show` → `did-finish-load` → `tray created`, and log tray-resume
     restores, so cold-start and resume cost can be measured on a real machine.
+    M8 completes this to a full 9-point instrumented timeline (below).
 - **Tests**: `npm test` runs `test/m7-lifecycle.test.js` (mocked Electron,
   no display needed) covering close-to-tray, focused/hidden notification
   behaviour, auto-dismiss, click-to-restore, dedup, disabled toggle,
   single-instance, and quit-cascade.
 
+## M8 — Startup Profiling / Cold-Start Measurement
+
+Goal: measure real cold-start cost per stage and determine whether the app
+can get **usable in under 3 seconds**. M8 adds **measurement only — no
+performance changes** (analysis and any optimisation come after data exists).
+
+### What is measured (9 points, `[perf]` lines in stdout)
+
+| # | Point | Meaning |
+|---|-------|---------|
+| 1 | `main process started` | main.js module load (≈ process start; true spawn is captured by the harness) |
+| 2 | `app ready` | Electron `app.whenReady()` resolved |
+| 3 | `BrowserWindow created` | window object constructed |
+| 4 | `loadURL start` | `loadURL(web.whatsapp.com)` issued |
+| 5 | `dom-ready` | first DOM of the page available |
+| 6 | `ready-to-show` | window painted, safe to show |
+| 7 | `tray created` | tray icon + menu ready (the "1–2 s" user-visible point) |
+| 8 | `did-finish-load` | initial load finished |
+| 9 | `first meaningful UI ready` | user can actually use WhatsApp |
+
+Point 9 is detected with a **read-only probe** (no DOM injection / CSS / JS
+overrides — the M1 principle stays intact): after `dom-ready`, every 500 ms
+the renderer is asked whether `#side` (chat list, logged-in session) or
+`.qr-code` (login screen) exists; the first match is logged as
+`first meaningful UI ready (chat-list | qr-code)`.
+
+### Running the measurement
+
+```bash
+# dev build (needs a display; `npm install` first)
+npm run measure:startup
+
+# packaged binary (AppImage or installed binary)
+npm run measure:startup -- --app /path/to/WhatsApp\ for\ Linux.AppImage
+
+# three runs, report min/avg
+npm run measure:startup -- --runs 3
+
+# worst case: drop the Chromium HTTP cache first (login/session untouched)
+npm run measure:startup -- --clear-cache
+
+# all options: --app, --dev, --runs N, --clear-cache, --kill,
+#              --timeout S, --user-data DIR
+```
+
+The harness (`scripts/measure-startup.sh`) launches the app with a unique
+marker, waits for point 9 (default 90 s), quits the app, and prints a
+timeline of all 9 points **relative to process spawn** plus key metrics:
+
+```
+key metrics (from process spawn):
+  electron/node bootstrap :     180ms
+  tray visible            :     980ms
+  window visible          :    2150ms
+  page loaded             :    2900ms
+  USABLE (first UI ready) :    3400ms   target < 3000ms  -> OVER TARGET by 400ms
+```
+
+Notes:
+- "Cold" = no running instance + fresh process. The **persistent login
+  session is kept** (it is part of the real scenario); `--clear-cache`
+  additionally clears only the HTTP cache (`Cache` + `Code Cache` under
+  `userData/Partitions/whatsapp-linux`) — cookies/IndexedDB are never touched.
+- Offsets in the `[perf]` lines are relative to main.js load, so the harness
+  adds the bootstrap offset to report spawn-relative times (± a few ms).
+- If another instance is running, the single-instance lock makes the fresh
+  process exit early and the harness reports that instead of garbage numbers
+  (or pass `--kill` to terminate it first).
+- Raw per-run logs are kept in a temp dir (path printed on exit) for
+  debugging.
+
+### Current baseline (real machine, packaged app)
+
+- Usable (first meaningful UI): **~4–5 s**
+- Tray visible: **~1–2 s**
+
+Next step (after collecting runs with the harness): identify the dominant
+cost stage(s) and evaluate optimisations against the **< 3 s** goal.
+
 ## Directory Structure
 ```
 whatsapp-linux/
 ├── src/
-│   ├── main.js         # Electron main (window, tray, session, events)
-│   └── preload.js      # Safe bridge (empty in M1 per principles)
+│   ├── main.js         # Electron main (window, tray, session, events, M8 [perf] instrumentation)
+│   ├── preload.js      # Safe bridge (empty in M1 per principles)
+│   ├── preload-settings.js
+│   └── settings.html
+├── scripts/
+│   └── measure-startup.sh  # M8 cold-start measurement harness (npm run measure:startup)
+├── test/
+│   └── m7-lifecycle.test.js # Mocked-Electron tests, incl. M8 instrumentation tests
 ├── build/
 │   ├── icons/icon.png  # App icon (AI-generated)
-│   ├── whatsapp-linux.desktop
-│   └── electron-builder.yml (in package.json)
-├── package.json        # Dependencies, build config
+│   └── whatsapp-linux.desktop
+├── package.json        # Dependencies, build config, scripts
 ├── .gitignore
 └── README.md
 ```

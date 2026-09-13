@@ -42,12 +42,22 @@ class MockBrowserWindow {
     this.__focused = false;
     this.__minimized = false;
     this.__destroyed = false;
-    this.webContents = {
+    const wc = {
+      __handlers: {},
       on: (ev, cb) => {
+        wc.__handlers[ev] = (wc.__handlers[ev] || []).concat([cb]);
         if (ev === 'notification') electronMock.__notificationHandler = cb;
       },
+      __emit: (ev, ...args) => {
+        (wc.__handlers[ev] || []).slice().forEach((cb) => cb(...args));
+      },
       setWindowOpenHandler: () => {},
+      // M8: default — the UI is not ready yet. The instrumentation test
+      // below overrides this to script the probe responses.
+      executeJavaScript: async () => null,
+      isDestroyed: () => this.__destroyed,
     };
+    this.webContents = wc;
     electronMock.__windows.push(this);
     if (!electronMock.__mainWindow) electronMock.__mainWindow = this;
   }
@@ -233,6 +243,68 @@ test('second instance: focuses existing window, no new BrowserWindow', () => {
   assert.strictEqual(electronMock.__windows.length, before, 'no second window');
   assert.strictEqual(win.__visible, true, 'window shown');
   assert.strictEqual(win.__focused, true, 'window focused');
+});
+
+// ---- M8: startup instrumentation -------------------------------------------
+//
+// The mock never emits page-load events on its own, so after `before()` the
+// recorded timeline ends at 'tray created' (+ the resume line from the
+// second-instance test above). The remaining points are fired explicitly
+// below. These tests must run BEFORE the quit test (it sets isQuitting).
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+test('startup instrumentation: records the startup lifecycle in order', () => {
+  const { __perfEvents } = require(path.join(__dirname, '..', 'src', 'main.js'));
+  assert.ok(Array.isArray(__perfEvents) && __perfEvents.length >= 5,
+    'perf events recorded in memory');
+  const labels = __perfEvents.map((e) => e.label);
+  assert.deepStrictEqual(labels.slice(0, 5), [
+    'main process started',
+    'app ready',
+    'BrowserWindow created',
+    'loadURL start',
+    'tray created'
+  ], 'first five lifecycle points in the expected order');
+  for (let i = 1; i < __perfEvents.length; i++) {
+    assert.ok(__perfEvents[i].ms >= __perfEvents[i - 1].ms,
+      'timestamps never decrease (event ' + i + ')');
+  }
+});
+
+test('startup instrumentation: dom-ready, ready-to-show, did-finish-load and first meaningful UI', async () => {
+  const { __perfEvents } = require(path.join(__dirname, '..', 'src', 'main.js'));
+
+  // Script the read-only UI probe: not ready on the first poll tick, ready
+  // (chat list) on the second -> the poller must wait, then record exactly
+  // one 'first meaningful UI ready' event.
+  let probes = 0;
+  win.webContents.executeJavaScript = async () => {
+    probes += 1;
+    return probes >= 2 ? 'chat-list' : null;
+  };
+
+  const nBefore = __perfEvents.length;
+  win.webContents.__emit('dom-ready'); // starts the 500ms UI poll
+  const deadline = Date.now() + 4000;
+  while (Date.now() < deadline &&
+         !__perfEvents.some((e) => e.label.startsWith('first meaningful UI ready'))) {
+    await sleep(100);
+  }
+  win.__emit('ready-to-show');         // window shown (default settings)
+  win.webContents.__emit('did-finish-load');
+
+  const labels = __perfEvents.slice(nBefore).map((e) => e.label);
+  assert.ok(labels.includes('dom-ready'), 'dom-ready recorded');
+  assert.ok(labels.includes('ready-to-show'), 'ready-to-show recorded');
+  assert.ok(labels.includes('did-finish-load (WhatsApp Web loaded)'),
+    'did-finish-load recorded');
+  assert.ok(labels.includes('first meaningful UI ready (chat-list)'),
+    'first meaningful UI ready recorded');
+  assert.ok(probes >= 2, 'probe retried until the UI matched');
+  assert.strictEqual(
+    __perfEvents.filter((e) => e.label.startsWith('first meaningful UI ready')).length,
+    1, 'UI-ready logged exactly once');
 });
 
 // Must run LAST: sets isQuitting=true via the before-quit path.
