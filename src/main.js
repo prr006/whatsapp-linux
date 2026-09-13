@@ -89,7 +89,14 @@ function createWindow () {
     console.error('Load failed:', validatedURL, errorCode, errorDescription);
   });
 
-  // Window closed — hide to tray if desired (M1: just clean up; M3 adds close-to-tray)
+  // M2 fix: close-to-tray — prevent window destruction on X, hide instead
+  mainWindow.on('close', (e) => {
+    e.preventDefault();
+    mainWindow.hide();
+    console.log('Window hidden to tray (close prevented)');
+  });
+
+  // Window actually destroyed (e.g., app quit), clean up reference
   mainWindow.on('closed', () => {
     mainWindow = null;
   });
