@@ -12,9 +12,16 @@ const path = require('path');
 // M7: startup/resume timing instrumentation (cheap, consistent with existing
 // console logging). Logs elapsed ms since main-process start at key lifecycle
 // points so cold-start and tray-resume cost can be measured on a real machine.
+// M8: events are also kept in memory (PERF_EVENTS) so the mocked-Electron
+// tests can assert on the recorded timeline, and scripts/measure-startup.sh
+// parses the [perf] stdout lines to build a full cold-start report (9 measured
+// startup points — see README, M8 section).
 const PERF_START_MS = Date.now();
+const PERF_EVENTS = [];
 function perfLog(label) {
-  console.log(`[perf] ${label}  (+${Date.now() - PERF_START_MS}ms)`);
+  const elapsedMs = Date.now() - PERF_START_MS;
+  PERF_EVENTS.push({ label: label, ms: elapsedMs });
+  console.log(`[perf] ${label}  (+${elapsedMs}ms)`);
 }
 perfLog('main process started');
 
@@ -182,6 +189,57 @@ if (!gotTheLock) {
   });
 }
 
+// M8: "first meaningful WhatsApp UI ready" detection.
+//
+// Read-only probe — the M1 principle (no DOM injection, no CSS, no JS
+// overrides) stays intact: nothing is written into the page. We only ask the
+// renderer whether one of two long-standing stable selectors exists:
+//   #side    -> chat list sidebar (existing, logged-in session)
+//   .qr-code -> QR container on the login screen (fresh session)
+// Either one is the point at which the user can actually use WhatsApp, so it
+// is the "usable" timestamp for cold-start measurement.
+const UI_READY_PROBE = [
+  '(function () {',
+  "  if (document.querySelector('#side')) return 'chat-list';",
+  "  if (document.querySelector('.qr-code')) return 'qr-code';",
+  '  return null;',
+  '})()'
+].join('\n');
+const UI_READY_POLL_INTERVAL_MS = 500;
+let uiReadyTimer = null;
+
+function stopFirstUIReadyProbe() {
+  if (uiReadyTimer !== null) {
+    clearInterval(uiReadyTimer);
+    uiReadyTimer = null;
+  }
+}
+
+// Idempotent (guarded): 'dom-ready' can fire again on reloads, but the probe
+// is (re)started only when it is not already running, and stops after the
+// first match — the first meaningful UI after startup is what gets recorded.
+function startFirstUIReadyProbe() {
+  if (uiReadyTimer !== null) return;
+  uiReadyTimer = setInterval(() => {
+    if (!mainWindow || mainWindow.isDestroyed() ||
+        mainWindow.webContents.isDestroyed()) {
+      stopFirstUIReadyProbe();
+      return;
+    }
+    mainWindow.webContents
+      .executeJavaScript(UI_READY_PROBE, false)
+      .then((result) => {
+        if (result) {
+          perfLog('first meaningful UI ready (' + result + ')');
+          stopFirstUIReadyProbe();
+        }
+      })
+      .catch(() => {
+        // Renderer mid-navigation/reload: just retry on the next tick.
+      });
+  }, UI_READY_POLL_INTERVAL_MS);
+}
+
 function createWindow () {
   // Default session already persists cookies / IndexedDB to userData
   mainWindow = new BrowserWindow({
@@ -204,6 +262,10 @@ function createWindow () {
     backgroundColor: '#111b21'
   });
   perfLog('BrowserWindow created');
+
+  // M8: mark loadURL start; the gap from here to 'dom-ready' below is the
+  // network + page-boot cost.
+  perfLog('loadURL start');
 
   // Load WhatsApp Web directly — NO DOM injection, NO custom CSS per principles
   mainWindow.loadURL('https://web.whatsapp.com', {
@@ -236,6 +298,13 @@ function createWindow () {
     console.error('Load failed:', validatedURL, errorCode, errorDescription);
   });
 
+  // M8: DOM-level load stage, and start the read-only first-meaningful-UI
+  // probe (see UI_READY_PROBE above).
+  mainWindow.webContents.on('dom-ready', () => {
+    perfLog('dom-ready');
+    startFirstUIReadyProbe();
+  });
+
   // M2 fix: close-to-tray — prevent window destruction on X, hide instead.
   // M7: during a real quit (isQuitting) the window must be allowed to close,
   // otherwise app.quit() would be aborted by the very handler meant to keep
@@ -251,6 +320,7 @@ function createWindow () {
 
   // Window actually destroyed (e.g., app quit), clean up reference
   mainWindow.on('closed', () => {
+    stopFirstUIReadyProbe();
     mainWindow = null;
   });
 
@@ -472,6 +542,14 @@ app.on('window-all-closed', () => {
 app.on('before-quit', () => {
   // M7: mark a genuine quit so the close-to-tray handler lets the window close.
   isQuitting = true;
+  stopFirstUIReadyProbe();
   // Clean log before exit
   console.log('WhatsApp for Linux shutting down');
 });
+
+// M8: export internals for the mocked-Electron test harness
+// (test/m7-lifecycle.test.js). Electron ignores main-process exports.
+module.exports = {
+  __perfStartMs: PERF_START_MS,
+  __perfEvents: PERF_EVENTS
+};
