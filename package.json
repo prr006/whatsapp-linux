@@ -1,0 +1,46 @@
+{
+  "name": "whatsapp-linux",
+  "version": "0.1.0",
+  "description": "WhatsApp for Linux — light desktop client around WhatsApp Web",
+  "main": "src/main.js",
+  "author": "Project Team",
+  "license": "MIT",
+  "keywords": ["whatsapp", "linux", "desktop", "electron"],
+  "homepage": "https://github.com/prr006/whatsapp-linux",
+  "scripts": {
+    "start": "electron .",
+    "build": "electron-builder",
+    "dist": "electron-builder --dir",
+    "test:build": "echo 'Build verification only — run manually with display server'"
+  },
+  "build": {
+    "appId": "com.prr006.whatsapp-linux",
+    "productName": "WhatsApp for Linux",
+    "copyright": "Copyright © 2026 Project Team",
+    "directories": {
+      "output": "dist",
+      "buildResources": "build"
+    },
+    "linux": {
+      "category": "Network",
+      "target": [
+        "AppImage",
+        "deb",
+        "rpm"
+      ],
+      "icon": "build/icons/icon.png"
+    },
+    "files": [
+      "src/**/*",
+      "build/**/*"
+    ],
+    "extraResources": [
+      "build/icons/icon.png"
+    ]
+  },
+  "devDependencies": {
+    "electron": "^44.3.0",
+    "electron-builder": "^26.0.12"
+  },
+  "dependencies": {}
+}

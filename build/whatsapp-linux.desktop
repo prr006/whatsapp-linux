@@ -1,0 +1,11 @@
+[Desktop Entry]
+Name=WhatsApp for Linux
+Comment=Desktop client for WhatsApp Web
+Exec=whatsapp-linux %U
+Type=Application
+Terminal=false
+Icon=whatsapp-linux
+Categories=Network;InstantMessaging;
+StartupNotify=true
+StartupWMClass=whatsapp-linux
+MimeType=x-scheme-handler/whatsapp;
