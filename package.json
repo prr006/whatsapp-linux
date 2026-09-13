@@ -3,9 +3,17 @@
   "version": "0.1.0",
   "description": "WhatsApp for Linux — light desktop client around WhatsApp Web",
   "main": "src/main.js",
-  "author": { "name": "Project Team", "email": "team@prr006.whatsapp-linux" },
+  "author": {
+    "name": "Project Team",
+    "email": "team@prr006.whatsapp-linux"
+  },
   "license": "MIT",
-  "keywords": ["whatsapp", "linux", "desktop", "electron"],
+  "keywords": [
+    "whatsapp",
+    "linux",
+    "desktop",
+    "electron"
+  ],
   "homepage": "https://github.com/prr006/whatsapp-linux",
   "scripts": {
     "start": "electron .",
@@ -22,11 +30,10 @@
       "buildResources": "build"
     },
     "linux": {
-        "category": "Network",
+      "category": "Network",
       "target": [
         "AppImage",
-        "deb",
-        "rpm"
+        "deb"
       ],
       "icon": "build/icons/icon.png"
     },
