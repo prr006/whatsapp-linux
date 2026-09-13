@@ -3,12 +3,31 @@
  * M1 Proof of Concept: loads WhatsApp Web with persistent session.
  */
 
-const { app, BrowserWindow, Tray, Menu, dialog, shell } = require('electron');
+const { app, BrowserWindow, Tray, Menu, dialog, shell, Notification } = require('electron');
 const path = require('path');
 
 // Keep references to avoid GC
 let mainWindow = null;
 let tray = null;
+
+// M2: lightweight dedup tracker for native notifications
+const recentNotifications = new Map();
+const NOTIFICATION_DEDUP_WINDOW_MS = 3000;
+function isDuplicate(key) {
+  const now = Date.now();
+  const last = recentNotifications.get(key);
+  if (last && (now - last) < NOTIFICATION_DEDUP_WINDOW_MS) {
+    return true;
+  }
+  recentNotifications.set(key, now);
+  // clean old entries to avoid unbounded growth
+  for (const [k, v] of recentNotifications) {
+    if ((now - v) > NOTIFICATION_DEDUP_WINDOW_MS) {
+      recentNotifications.delete(k);
+    }
+  }
+  return false;
+}
 
 // Lock to single instance
 const gotTheLock = app.requestSingleInstanceLock();
@@ -82,6 +101,45 @@ function createWindow () {
 
   mainWindow.webContents.on('did-finish-load', () => {
     console.log('Page loaded successfully');
+  });
+
+  // M2: Native Linux desktop notifications via Electron Notification API
+  // We listen to WhatsApp Web's standard web Notification events and
+  // replace them with native notifications to work when hidden/minimized.
+  mainWindow.webContents.on('notification', (event, notification, actions) => {
+    // Prevent the default web notification from also showing (avoid duplicates)
+    event.preventDefault();
+
+    const title = notification.title || 'WhatsApp';
+    const body = notification.body || '';
+    const iconPath = path.join(__dirname, '..', 'build', 'icons', 'icon.png');
+
+    // Dedup key: title + first 50 chars of body
+    const dedupKey = title + '|' + body.substring(0, 50);
+    if (isDuplicate(dedupKey)) {
+      console.log('Notification suppressed (duplicate):', title);
+      return;
+    }
+
+    // Only show native notification; keep it lightweight/non-blocking
+    const nativeNotif = new Notification({
+      title: title,
+      body: body,
+      icon: iconPath,
+      hasReply: false,
+      silent: false
+    });
+
+    nativeNotif.on('click', () => {
+      if (mainWindow) {
+        if (mainWindow.isMinimized()) mainWindow.restore();
+        mainWindow.show();
+        mainWindow.focus();
+      }
+    });
+
+    nativeNotif.show();
+    console.log('Native notification shown:', title, '|', body.substring(0, 60));
   });
 }
 
