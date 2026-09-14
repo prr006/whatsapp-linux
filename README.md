@@ -2,7 +2,7 @@
 
 A polished, lightweight Linux desktop client around the official WhatsApp Web experience.
 
-> **Status:** M9 (current) — Linux desktop integration, settings correctness, notification polish, and release polish, building on M8 (startup profiling) and M7 (startup + notification UX). Verified on a real machine: packaged app takes roughly **4–5 s until WhatsApp is usable**, while the tray appears in roughly **1–2 s**.
+> **Status:** M11 (current) — Linux dock/app-icon unread badge, building on M10 (GNOME banner persistence), M9 (Linux desktop integration, settings, notification polish, release polish), M8 (startup profiling) and M7 (startup + notification UX). The 4–5 s usable / 1–2 s tray figures below were measured on a real machine during M8/M9; **M11 has not yet been run on a real desktop** — see *M11 → Packaged-app verification* for the procedure.
 
 ## Project Goals (from specification)
 - WhatsApp Web login via QR
@@ -29,7 +29,9 @@ A polished, lightweight Linux desktop client around the official WhatsApp Web ex
 - M4 (optional): Voice/video calls, app lock, updater.
 - M7 (merged): Startup + notification UX polish — see below.
 - M8 (merged): Startup profiling / cold-start measurement — see below.
-- **M9 (current): Linux integration, settings, notifications & release polish** — see below.
+- M9 (merged): Linux integration, settings, notifications & release polish — see below.
+- M10 (merged): GNOME banner persistence fix (`test/m10-gnome-persistence.test.js`).
+- **M11 (current): Linux dock / app-icon unread badge** — see below.
 
 ## M7 — Startup & Notification UX
 - **Notifications** (see `webContents.on('notification')` in `src/main.js`):
@@ -283,6 +285,208 @@ grep '\[notif\]' /tmp/whatsapp-notif.log
 #    "whatsapp-linux", hint desktop-entry) followed by ActionInvoked "default".
 ```
 
+## M11 — Linux dock / app-icon unread badge
+
+Goal: show the unread count on the **`whatsapp-linux` application icon** in the
+dock/launcher (not inside the window, not only in the tray), updated as messages
+arrive, cleared when the user focuses/reopens WhatsApp.
+
+### What is actually supported (verified 2026-09-14)
+
+| Question | Answer | Evidence |
+|---|---|---|
+| Does **stock GNOME Shell 50** render app-icon badges? | **No.** There is no GNOME-native badge API. | [gnome-shell#511](https://gitlab.gnome.org/GNOME/gnome-shell/-/work_items/511) "Attention badges on icons in application switcher and activities dock" is still **Open** (labels `1. Feature`, `2. Needs Design`, unassigned). The related [#319 "Favourites should use notification badges"](https://gitlab.gnome.org/GNOME/gnome-shell/-/work_items/319) was **Closed — `3. Out of Scope`**. GNOME 50 "Tokyo" shipped 2026-03-18 with no badge feature. |
+| Is there a supported cross-desktop protocol? | **Yes** — Canonical's **Unity Launcher API**, `com.canonical.Unity.LauncherEntry`. It is a plain **session-bus D-Bus signal**, so X11 vs Wayland makes no difference (no X11 property, no window handle). | [wiki.ubuntu.com/Unity/LauncherAPI](https://wiki.ubuntu.com/Unity/LauncherAPI) |
+| Which docks implement it? | Dash to Dock **and** its Ubuntu Dock fork (both verified in source this milestone), plus Dash to Panel, plank, gershwin-workspace. It is the protocol Firefox/Thunderbird/Telegram/Evolution use. | Dash to Dock `master` (v106) `launcherAPI.js`: `signal_subscribe(null, 'com.canonical.Unity.LauncherEntry', 'Update', null, …)` and `own_name('com.canonical.Unity', …)`. Its `metadata.json` declares `shell-version: 45…51`, so **GNOME 50 is covered**. |
+| Does the **current dock** show it by default? | **Yes.** | Dash to Dock gschema defaults: `show-icons-emblems=true`, `show-icons-notifications-counter=true`, `application-counter-overrides-notifications=true`. `appIconIndicators.js::_updateNotificationsCount()` uses the app-provided `count` whenever it is > 0. |
+| Does **Electron 44** support it? | **Yes, natively — no libunity, no hand-rolled D-Bus.** | electron#52895 "Restored `app.setBadgeCount` and `win.setProgressBar` for Linux … These APIs now support any dock or taskbar which implements the LauncherEntry D-Bus API, and they no longer require libunity" — in **44.0.0**, and this app pins **44.3.0**. Locally confirmed in `node_modules/electron/electron.d.ts`: `setBadgeCount(count?: number): boolean` and `badgeCount: number`, both `@platform linux,darwin`; `isUnityRunning` is **gone** (0 occurrences), matching the Electron 44 breaking change "Removed: Unity desktop environment support on Linux". |
+
+**Conclusion.** The correct mechanism is `app.setBadgeCount(n)` — a supported
+Electron API — which emits on the session bus:
+
+```
+signal com.canonical.Unity.LauncherEntry.Update
+path   /com/canonical/unity/launcherentry
+args   ("application://<CHROME_DESKTOP>",
+        {"count": <x int64>, "count-visible": <b bool = count != 0>})
+```
+
+Nothing else was considered acceptable: drawing a badge inside the BrowserWindow
+is a fake, `setOverlayIcon` is `@platform win32` (a no-op on Linux), swapping the
+tray/window icon is not a dock badge, and hand-rolling the D-Bus signal would
+duplicate code Electron already ships.
+
+### The one thing that silently breaks it: the `.desktop` suffix
+
+`launcher_entry.cc` builds the URI as `"application://" + platform_util::
+GetDesktopName()`, and `GetDesktopName()` is literally `getenv("CHROME_DESKTOP")`
+— **the suffix is not added**. Electron seeds `CHROME_DESKTOP` from
+`package.json`'s `desktopName` verbatim (`lib/browser/init.ts`:
+`app.setDesktopName(packageJson.desktopName || defaultDesktopName(app.name))`).
+With this repo's `desktopName: "whatsapp-linux"` the emitted URI would be
+`application://whatsapp-linux`, while docks match it against `Shell.App.id`,
+which GNOME sets to the **`.desktop` filename** (`whatsapp-linux.desktop`) — so
+the badge would never appear, and `app.setBadgeCount()` would still "succeed".
+
+Fix: `src/main.js` calls `app.setDesktopName('whatsapp-linux.desktop')` at module
+load (before `ready`, as Electron documents). Verified consequences:
+
+- `GetXdgAppId()` strips `.desktop` → **still `whatsapp-linux`**, so the Wayland
+  `app_id`/`WM_CLASS` and the `desktop-entry` notification hint used by M9/M10
+  are byte-for-byte unchanged.
+- `version_info::nix::GetAppName()`/`GetSessionNamePrefix()` strip `.desktop` →
+  app_id and DBus object-path prefix unchanged.
+- `Browser::IsDefaultProtocolClient()`/`SetDefaultWebClient()` build a
+  `GDesktopAppInfo` from `CHROME_DESKTOP`, which *requires* the suffix → now
+  correct instead of broken.
+- `package.json` keeps the bare `desktopName` the M9 tests assert on;
+  electron-builder strips a trailing `.desktop` anyway
+  (`LinuxTargetHelper.getDesktopFileName`).
+
+Running the **real** electron-builder 26.15.3 from this repo confirms both sides
+agree (this is what `test/m11-dock-badge.test.js` executes, not a re-derivation):
+
+```
+getDesktopFileName() -> whatsapp-linux.desktop
+[Desktop Entry]
+Name=WhatsApp for Linux
+Exec=/opt/whatsapp-linux/whatsapp-linux %U
+Terminal=false
+Type=Application
+Icon=whatsapp-linux
+StartupWMClass=whatsapp-linux
+```
+
+### Implementation (`src/main.js`)
+
+- `DESKTOP_FILE_ID = 'whatsapp-linux.desktop'` + `app.setDesktopName(...)` before
+  `ready` (above).
+- `pushDockBadge(count, reason)` — normalises to a non-negative integer, calls
+  `app.setBadgeCount(count)` (0 ⇒ `count-visible=false` ⇒ badge hidden), records
+  `{count, reason, delivered, ok, error, at}` in `__badgeUpdates`, and logs a
+  `[badge]` line. A `false`/throwing call is recorded, never propagated, and
+  never touches unread state.
+- `updateDockBadge(reason)` — derives the count from the **existing**
+  `unreadCount` and deduplicates, so an unchanged value does not re-emit a
+  fire-and-forget signal.
+- `updateUnreadIndicator(reason)` — now calls the dock badge **first**, then the
+  tray tooltip, then the Windows-only overlay. The old leading
+  `if (!tray) return;` guard is gone: it silently disabled *every* indicator
+  whenever tray creation failed (`test/m11-dock-badge-no-tray.test.js` guards
+  this — it fails if the guard is restored).
+- `before-quit` forces a final `count=0` (only if a non-zero badge is showing),
+  so no dock keeps a stale badge for an exited app.
+
+**Unchanged:** the unread counter, its clear-on-focus/clear-on-show semantics,
+the tray tooltip/icon, single-instance restore, the preload `Notification` shim,
+notification dedup and the settings toggles, and the whole M10 history model
+(still no auto-dismiss timer — asserted in the M11 suite). The badge is purely
+additive on top of the same counter.
+
+### Behaviour
+
+| Event | `unreadCount` | Dock badge |
+|---|---|---|
+| Message while hidden/backgrounded | +1 | `setBadgeCount(n)` |
+| Further messages | +1 each | `setBadgeCount(n+1)` |
+| Duplicate (same title+body within 3 s) | unchanged | no signal |
+| Message while the window is focused | unchanged | no signal, no banner |
+| Notifications disabled in Settings | +1 | `setBadgeCount(n)` (no banner) |
+| Window focused, or reopened from tray, or notification clicked | 0 | `setBadgeCount(0)` → hidden |
+| Quit with a badge showing | — | final `setBadgeCount(0)` |
+
+### Known limitation of the protocol (not worked around)
+
+The Unity launcher API is **signal-only** — there is no state for a dock to
+re-query. If the dock is disabled or restarted while the app is idle (GNOME Shell
+disables extensions on screen lock — [dash-to-dock#708](https://github.com/micheleg/dash-to-dock/issues/708)),
+a badge set during that window is lost until the count next changes. We re-emit
+on every change and force one clear on quit, and deliberately do **not** add a
+polling re-announce loop.
+
+### Tests
+
+```bash
+node --check src/main.js
+npm test          # 60 tests, mocked Electron, no display needed
+```
+
+- `test/m11-dock-badge.test.js` (18 tests) — desktop identity (incl. the real
+  electron-builder filename/`StartupWMClass` check), every transition above,
+  badge/tray lockstep, dedup of unchanged pushes, non-negative integer
+  normalisation, rejected-call handling, M10 history invariants, quit clear.
+- `test/m11-dock-badge-no-tray.test.js` (1 test) — badge survives a tray-init
+  failure. Mutation-checked: restoring `if (!tray) return;` makes it fail.
+
+### Packaged-app verification (real Ubuntu GNOME/Wayland desktop)
+
+This cannot run in the sandbox (no display server, and the Electron binary
+download is blocked — see Known Issues). On a real machine:
+
+```bash
+npm run dist                       # or: npm run pack  (dist/linux-unpacked/, no installer)
+sudo apt install ./dist/*.deb      # or run dist/linux-unpacked/whatsapp-linux directly
+
+# 0. Confirm the desktop identity the badge is keyed on:
+ls /usr/share/applications/ | grep -i whatsapp      # -> whatsapp-linux.desktop
+
+# 1. Watch the actual D-Bus traffic in one terminal:
+dbus-monitor --session "interface='com.canonical.Unity.LauncherEntry'"
+
+# 2. Run the packaged app and log it:
+"/opt/WhatsApp for Linux/whatsapp-linux" 2>&1 | tee /tmp/whatsapp-badge.log
+
+# 3. Pin the launcher entry to the dock, then hide the window to the tray
+#    and send yourself a message.
+#    dbus-monitor must show, once per unread message:
+#      signal ... path=/com/canonical/unity/launcherentry;
+#        interface=com.canonical.Unity.LauncherEntry; member=Update
+#        string "application://whatsapp-linux.desktop"
+#        array [ dict entry("count", int64 1)
+#                dict entry("count-visible", boolean true) ]
+#    and the app must log:
+grep '\[badge\]' /tmp/whatsapp-badge.log
+#      [badge] app.setBadgeCount(1) -> emitted | message received (unread=1)
+
+# 4. Send a second message -> count int64 2, badge updates in place.
+# 5. Click the dock icon (or the banner, or the tray "Show WhatsApp"):
+#      [badge] app.setBadgeCount(0) -> emitted | window focused
+#    -> count-visible boolean false, badge gone, tray tooltip back to
+#       "WhatsApp for Linux".
+# 6. Quit while a badge is showing -> one final count 0 signal.
+```
+
+If step 3 shows the signal but **no number is painted**, check the dock, in this
+order:
+
+```bash
+gnome-shell --version
+gnome-extensions list --enabled | grep -E 'dash-to-dock|ubuntu-dock'
+gsettings get org.gnome.shell.extensions.dash-to-dock show-icons-emblems
+gsettings get org.gnome.shell.extensions.dash-to-dock application-counter-overrides-notifications
+```
+
+On a **vanilla GNOME session with no dock extension** the signal is emitted and
+correctly ignored — that is the upstream limitation described above, not a bug in
+this app.
+
+Reading the app's own trace is enough to tell the two failure modes apart
+without a dock at all:
+
+```bash
+grep '\[badge\]' /tmp/whatsapp-badge.log
+# "app.setBadgeCount(1) -> emitted"                        -> Electron sent the
+#                                                              signal; anything
+#                                                              missing is the dock.
+# "app.setBadgeCount(1) -> REJECTED (desktop id unresolved?)"
+#                                                          -> CHROME_DESKTOP is
+#                                                              unset, i.e.
+#                                                              app.setDesktopName()
+#                                                              did not take effect;
+#                                                              no dock can ever show it.
+# "skip app.setBadgeCount(1): not linux (...)"             -> not running on Linux.
+```
+
 ## Directory Structure
 ```
 whatsapp-linux/
@@ -296,7 +500,10 @@ whatsapp-linux/
 │   └── measure-resources.sh  # M9 idle RAM/CPU baseline (measurement only)
 ├── test/
 │   ├── m7-lifecycle.test.js        # Mocked-Electron lifecycle/notification tests
-│   └── m9-linux-integration.test.js# M9 desktop identity, autostart, start-minimized, notification edge cases
+│   ├── m9-linux-integration.test.js# M9 desktop identity, autostart, start-minimized, notification edge cases
+│   ├── m10-gnome-persistence.test.js # M10 banner expiration vs GNOME history removal
+│   ├── m11-dock-badge.test.js      # M11 dock badge state transitions + desktop identity
+│   └── m11-dock-badge-no-tray.test.js # M11 badge survives a tray-init failure
 ├── build/
 │   ├── icons/icon.png  # App icon (AI-generated)
 │   └── whatsapp-linux.desktop
@@ -318,14 +525,15 @@ npm run dist   # AppImage / deb (electron-builder)
 
 ## Test
 ```bash
-npm test       # node --test test/*.test.js — 29 tests, mocked Electron, no display needed
+npm test       # node --test test/*.test.js — 60 tests, mocked Electron, no display needed
 ```
 
 ## Testing Protocol (per instructions)
 After M1 build: initial launch → QR display → login → send message → receive message → close → reopen → session persistence → inspect logs → verify no Chromium errors.
 
 ## Known Issues / Limitations
-- **Electron binary download blocked** in this sandbox (`curl`/`node fetch` fail to `github.com/electron` releases with SSL errors). `npm install` succeeds (285 packages), `node --check`, `npm test`, and the build-config audit all pass, but `npm run dist` stops at the electron binary download step ("unable to verify the first certificate") and actual launch requires downloading `electron-v44.3.0-linux-x64.zip` (~180 MB) or an environment with unrestricted download.
+- **Electron binary download blocked** in this sandbox. `npm install` succeeds (284 packages, `electron@44.3.0` + `electron-builder@26.15.3` metadata and typings present) and `node --check` / `npm test` pass, but the prebuilt runtime is not obtainable: `node node_modules/electron/install.js` fails with `TypeError: fetch failed`, and `npm run dist` stops at `packaging … electron=44.3.0` with `RequestError: unable to verify the first certificate`. Root cause measured directly — `github.com` answers (302) but the release asset host `release-assets.githubusercontent.com` / `objects.githubusercontent.com` is reset before the TLS handshake completes (`ECONNRESET`, also with `-k` and with the sandbox CA in `NODE_EXTRA_CA_CERTS`); the usual mirrors (`registry.npmmirror.com`, `cdn.npmmirror.com`, `download.electronjs.org`, `mirrors.tuna.tsinghua.edu.cn`) are unreachable too. So the M11 packaged-app verification below must run on a machine with normal egress.
+- **M11 dock badge not yet observed on a real desktop.** The D-Bus payload, the `CHROME_DESKTOP` plumbing and the dock-side matching logic are all verified against Electron 44.3.0 / Dash to Dock v106 sources and by the mocked tests, but no badge has been seen painted (no display server here). Follow *M11 → Packaged-app verification*.
 - **No display server** (Xvfb) installed; launch would require `DISPLAY=:99` or a real X11/Wayland session. This also means the M9 resource baseline (`npm run measure:resources`) and any dock/taskbar/WM_CLASS observation must run on a real desktop — the script is provided and measurement-only.
 - **No system browsers** installed for independent WhatsApp Web verification (not required since Electron bundles Chromium).
 - **Tray/dock behaviour untested at runtime** in this sandbox; code uses standard Electron `Tray`, `Menu`, single-instance and XDG autostart APIs, verified by mocked tests and the build-config audit.

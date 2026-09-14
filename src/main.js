@@ -9,6 +9,42 @@ const fs = require('fs');
 app.setName('whatsapp-linux');
 const path = require('path');
 
+// M11: the `.desktop` file ID this app owns at runtime.
+//
+// Why the suffix matters (verified against Electron 44.3.0 sources):
+//   * lib/browser/init.ts does
+//       app.setDesktopName(packageJson.desktopName || defaultDesktopName(app.name))
+//     i.e. CHROME_DESKTOP is taken verbatim from package.json's `desktopName`.
+//   * shell/common/platform_util_linux.cc: `GetDesktopName()` == getenv("CHROME_DESKTOP").
+//   * shell/browser/linux/launcher_entry.cc: the launcher-entry app URI is
+//       "application://" + GetDesktopName()          <-- the suffix is NOT added
+//     so with `desktopName: "whatsapp-linux"` Electron would emit
+//     `application://whatsapp-linux`, which no dock can match.
+//   * Docks compare that URI against the running app's desktop ID *with* the
+//     suffix. Dash to Dock (launcherAPI.js) strips only the `application://`
+//     scheme and looks the result up by `Shell.App.id`, which GNOME sets to the
+//     `.desktop` filename (`whatsapp-linux.desktop`).
+//
+// electron-builder derives the packaged filename with
+// `desktopName.replace(/\.desktop$/, '') + '.desktop'` (LinuxTargetHelper.
+// getDesktopFileName), so package.json can keep the bare `desktopName` that the
+// M9 tests assert on, while the runtime ID used for the launcher entry must
+// carry the suffix. Set it explicitly here so the two cannot drift silently —
+// test/m11-dock-badge.test.js pins both sides together.
+//
+// This also leaves every other CHROME_DESKTOP consumer unchanged or better:
+//   * GetXdgAppId() strips `.desktop` -> still `whatsapp-linux` (Wayland app_id
+//     and the `desktop-entry` notification hint are untouched).
+//   * version_info::nix::GetAppName()/GetSessionNamePrefix() strip `.desktop`
+//     -> unchanged app_id / DBus object-path prefix.
+//   * Browser::IsDefaultProtocolClient()/SetDefaultWebClient() build a
+//     GDesktopAppInfo from CHROME_DESKTOP, which *requires* the suffix.
+const DESKTOP_FILE_ID = 'whatsapp-linux.desktop';
+if (process.platform === 'linux' && typeof app.setDesktopName === 'function') {
+  app.setDesktopName(DESKTOP_FILE_ID);
+}
+
+
 // M7: startup/resume timing instrumentation (cheap, consistent with existing
 // console logging). Logs elapsed ms since main-process start at key lifecycle
 // points so cold-start and tray-resume cost can be measured on a real machine.
@@ -289,9 +325,10 @@ function handleWebNotification(notification) {
   }
 
   // Count as unread regardless of the notification toggle (keeps M2/M3
-  // tray badge/tooltip behaviour intact even when banners are disabled).
+  // tray badge/tooltip behaviour intact even when banners are disabled, and
+  // M11 keeps the dock badge on the same counter).
   unreadCount++;
-  updateUnreadIndicator();
+  updateUnreadIndicator('message received (unread=' + unreadCount + ')');
 
   const s = loadSettings();
   if (!s.notificationsEnabled) {
@@ -439,19 +476,161 @@ function isMainWindowFocused() {
 }
 
 
-function updateUnreadIndicator() {
-  if (!tray) return;
-  const badgePath = getRuntimeIconFile('icon-badge.png');
-  if (unreadCount > 0) {
-    tray.setToolTip('WhatsApp — ' + unreadCount + ' unread');
-    if (mainWindow) {
-      try { mainWindow.setOverlayIcon(badgePath); } catch (e) { /* overlay not critical */ }
+// ---------------------------------------------------------------------------
+// M11 — Linux dock / app-icon unread badge
+// ---------------------------------------------------------------------------
+//
+// WHAT IS ACTUALLY SUPPORTED ON GNOME/Wayland (verified 2026-09-14)
+//
+// * Stock GNOME Shell (including GNOME 50 "Tokyo", released 2026-03-18) has NO
+//   app-icon badge/counter. The upstream request is still open and unassigned:
+//   gitlab.gnome.org/GNOME/gnome-shell/-/work_items/511 ("Attention badges on
+//   icons in application switcher and activities dock", status **Open**,
+//   labels "1. Feature" + "2. Needs Design"); the related #319 "Favourites
+//   should use notification badges" was closed **"3. Out of Scope"**. So there
+//   is no GNOME-native badge API to call — nothing we can do will put a number
+//   on the dash of a vanilla GNOME 50 session.
+//
+// * The de-facto protocol every Linux dock implements is Canonical's
+//   **Unity Launcher API** (`com.canonical.Unity.LauncherEntry`). It is a plain
+//   session-bus D-Bus signal, so it works identically under X11 and Wayland
+//   (no X11 property, no window handle, nothing Wayland-specific). Confirmed in
+//   source this milestone for Dash to Dock (launcherAPI.js + gschema) and its
+//   Ubuntu Dock fork; Dash to Panel, plank and gershwin-workspace implement it
+//   too, and it is the protocol Firefox/Thunderbird/Telegram/Evolution use.
+//
+// * **Electron 44 supports it natively.** electron#52895 ("Restored
+//   app.setBadgeCount and win.setProgressBar for Linux") landed in 44.0.0 and
+//   is in the 44.3.0 this app pins. `Browser::SetBadgeCount()` calls
+//   `electron::launcher_entry::SetBadgeCount()`, which emits on the session
+//   bus:
+//       signal com.canonical.Unity.LauncherEntry.Update
+//       path   /com/canonical/unity/launcherentry
+//       args   ("application://<CHROME_DESKTOP>",
+//               {"count": <x int64>, "count-visible": <b bool = count != 0>})
+//   It no longer needs libunity (the old implementation dlopen'd
+//   libunity.so.9, which no GNOME system ships), and `app.isUnityRunning()` was
+//   removed. This is a *supported Electron API*, not a hack — so we use it and
+//   do NOT hand-roll the D-Bus traffic ourselves.
+//
+// * Dash to Dock renders it by default. Its gschema defaults are
+//   `show-icons-emblems=true`, `show-icons-notifications-counter=true` and
+//   `application-counter-overrides-notifications=true`, and
+//   appIconIndicators.js `_updateNotificationsCount()` prefers the app-provided
+//   `count` whenever it is > 0. launcherAPI.js subscribes with `path = null`,
+//   so Electron's object path is accepted.
+//
+// CONSEQUENCE: emitting the signal is correct and unconditional; whether a
+// number is *painted* is the dock's decision. On a bare GNOME 50 session
+// nothing is painted, on Ubuntu Dock / Dash to Dock the unread count appears.
+// That is the honest ceiling — the app must not fake a badge inside its own
+// window to compensate, and must not depend on a dock we cannot detect.
+//
+// Known protocol limitation (dash-to-dock#708): the API is signal-only, there
+// is no state to re-query, so if the dock is disabled/restarted (GNOME Shell
+// disables extensions on screen lock) a badge set while it was away is lost
+// until the count next changes. We re-emit on every change and force one final
+// clear on quit; we deliberately do NOT add a polling re-announce loop.
+// ---------------------------------------------------------------------------
+
+// `[badge]`-prefixed log lines, mirroring the `[notif]` convention so a real
+// packaged-desktop run can be traced with `grep '\[badge\]'`.
+function badgeLog(...args) {
+  console.log('[badge]', ...args);
+}
+
+// Every badge state transition, newest last. Exported for the mocked-Electron
+// tests. `delivered` is true only when Electron actually emitted the D-Bus
+// signal (Linux + working setBadgeCount); `count` is what we *intended*, which
+// is the part the unread state machine is responsible for on every platform.
+const BADGE_UPDATES = [];
+
+// Last count handed to Electron. `null` = nothing pushed yet, so the very first
+// update is always emitted (including a "0" that confirms a clean start).
+let lastPushedBadgeCount = null;
+
+function dockBadgeSupported() {
+  return process.platform === 'linux' && typeof app.setBadgeCount === 'function';
+}
+
+// Unconditionally push `count` to the dock (0 hides the badge: Electron sends
+// `count-visible = count != 0`).
+function pushDockBadge(count, reason) {
+  const normalized = Number.isFinite(count) ? Math.max(0, Math.trunc(count)) : 0;
+  const entry = {
+    count: normalized,
+    reason: reason || 'unknown',
+    delivered: false,
+    ok: null,
+    error: null,
+    at: Date.now()
+  };
+
+  lastPushedBadgeCount = normalized;
+
+  if (!dockBadgeSupported()) {
+    entry.error = process.platform === 'linux'
+      ? 'app.setBadgeCount unavailable (Electron < 44?)'
+      : 'not linux (' + process.platform + ')';
+    BADGE_UPDATES.push(entry);
+    badgeLog('skip app.setBadgeCount(' + normalized + '):', entry.error, '|', entry.reason);
+    return entry;
+  }
+
+  try {
+    // Returns false when Electron could not resolve the app's desktop ID
+    // (CHROME_DESKTOP unset) — see DESKTOP_FILE_ID above, which is why we call
+    // app.setDesktopName() at startup.
+    entry.ok = app.setBadgeCount(normalized) === true;
+    entry.delivered = entry.ok;
+    badgeLog(
+      'app.setBadgeCount(' + normalized + ') ->',
+      entry.ok ? 'emitted' : 'REJECTED (desktop id unresolved?)',
+      '|', entry.reason
+    );
+  } catch (err) {
+    entry.error = err && err.message ? err.message : String(err);
+    badgeLog('app.setBadgeCount(' + normalized + ') threw:', entry.error, '|', entry.reason);
+  }
+
+  BADGE_UPDATES.push(entry);
+  return entry;
+}
+
+// Sync the dock badge with the existing unread state. Deduplicated: the Unity
+// launcher protocol is fire-and-forget, so re-sending an unchanged count would
+// only add session-bus noise (and would re-trigger a badge animation).
+function updateDockBadge(reason) {
+  const count = unreadCount > 0 ? unreadCount : 0;
+  if (lastPushedBadgeCount === count) {
+    return null;
+  }
+  return pushDockBadge(count, reason);
+}
+
+function updateUnreadIndicator(reason) {
+  // M11: the dock badge is the primary Linux indicator and must NOT depend on
+  // the tray having been created successfully (the old `if (!tray) return;`
+  // guard silently disabled every indicator when tray init failed).
+  updateDockBadge(reason);
+
+  // Tray tooltip + tray icon unread state (unchanged from M2/M3).
+  if (tray) {
+    if (unreadCount > 0) {
+      tray.setToolTip('WhatsApp — ' + unreadCount + ' unread');
+    } else {
+      tray.setToolTip('WhatsApp for Linux');
     }
-  } else {
-    tray.setToolTip('WhatsApp for Linux');
-    if (mainWindow) {
-      try { mainWindow.setOverlayIcon(null); } catch (e) { /* overlay not critical */ }
-    }
+  }
+
+  // Windows-only taskbar overlay (win.setOverlayIcon is @platform win32, so on
+  // Linux this was always a no-op). Kept for Windows; the Linux badge above is
+  // the real dock indicator.
+  if (mainWindow && process.platform === 'win32') {
+    const badgePath = getRuntimeIconFile('icon-badge.png');
+    try {
+      mainWindow.setOverlayIcon(unreadCount > 0 ? badgePath : null);
+    } catch (e) { /* overlay not critical */ }
   }
 }
 
@@ -643,17 +822,20 @@ function createWindow () {
   // previous `webContents.on('notification', ...)` handler never fired.
 
   // M3: reset unread when user returns to app
+  // M11: clearing unread here is also what clears the dock badge — the badge is
+  // derived from the same counter, so "focus the app" and "badge disappears"
+  // stay in lockstep with the tray tooltip.
   mainWindow.on('focus', () => {
     if (unreadCount > 0) {
       unreadCount = 0;
-      updateUnreadIndicator();
+      updateUnreadIndicator('window focused');
       console.log('Unread cleared (focus)');
     }
   });
   mainWindow.on('show', () => {
     if (unreadCount > 0) {
       unreadCount = 0;
-      updateUnreadIndicator();
+      updateUnreadIndicator('window shown from tray');
       console.log('Unread cleared (show from tray)');
     }
   });
@@ -782,12 +964,20 @@ app.on('before-quit', () => {
   // M7: mark a genuine quit so the close-to-tray handler lets the window close.
   isQuitting = true;
   stopFirstUIReadyProbe();
+  // M11: force a final count=0 so no dock is left showing a stale badge for an
+  // app that is gone. Most docks also drop the entry when our session-bus name
+  // disappears (Dash to Dock tracks it via NameOwnerChanged), but that is the
+  // dock's behaviour, not a contract we should rely on.
+  if (lastPushedBadgeCount !== null && lastPushedBadgeCount !== 0) {
+    pushDockBadge(0, 'app quitting');
+  }
   // Clean log before exit
   console.log('WhatsApp for Linux shutting down');
 });
 
-// M8/M9: export internals for the mocked-Electron test harness
-// (test/m7-lifecycle.test.js, test/m9-linux-integration.test.js).
+// M8/M9/M11: export internals for the mocked-Electron test harness
+// (test/m7-lifecycle.test.js, test/m9-linux-integration.test.js,
+//  test/m10-gnome-persistence.test.js, test/m11-dock-badge.test.js).
 // Electron ignores main-process exports.
 module.exports = {
   __perfStartMs: PERF_START_MS,
@@ -800,5 +990,12 @@ module.exports = {
   __setStartWithSystem: setStartWithSystem,
   __activeNotifications: activeNotifications,
   __showNativeNotification: showNativeNotification,
-  __dismissNotification: dismissNotification
+  __dismissNotification: dismissNotification,
+  // M11: dock/app-icon unread badge
+  __desktopFileId: DESKTOP_FILE_ID,
+  __badgeUpdates: BADGE_UPDATES,
+  __dockBadgeSupported: dockBadgeSupported,
+  __pushDockBadge: pushDockBadge,
+  __updateDockBadge: updateDockBadge,
+  __getUnreadCount: () => unreadCount
 };
