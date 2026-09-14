@@ -94,6 +94,96 @@ let unreadCount = 0;
 // a short window so behaviour is consistent with a polished desktop UX.
 const NOTIFICATION_TIMEOUT_MS = 5000;
 
+// M9 bugfix: strong references to every live native notification.
+//
+// Electron's `Notification` is a thin JS wrapper around the libnotify object;
+// the JS wrapper only holds a WeakPtr to the native side. If the JS object is
+// garbage collected, Electron calls `set_delegate(nullptr)` on the native
+// notification, after which the `click` event can no longer be delivered to JS
+// (so `showAndFocusMainWindow()` never runs) — the canonical "Linux
+// notification click does nothing" failure. Retaining each notification here,
+// and releasing it only on click / daemon close / failure, keeps click
+// delivery alive for the banner's entire visible lifetime.
+const activeNotifications = new Set();
+
+// Diagnostic logging for the notification path. Prefixed `[notif]` so the real
+// packaged-desktop run can be traced with `grep '[notif]'` (see the manual
+// verification procedure in the M9 bugfix notes / README).
+function notifLog(...args) {
+  console.log('[notif]', ...args);
+}
+
+// Single place that closes a native notification and releases its strong
+// reference. `close()` maps to libnotify's notify_notification_close()
+// (a CloseNotification DBus request) on Linux, so the daemon owns the final
+// visual dismissal; it is idempotent and safe to call after a click/daemon
+// close has already destroyed the native object.
+function dismissNotification(nativeNotif, title, reason) {
+  notifLog('dismissing (' + reason + ')', title);
+  try {
+    nativeNotif.close();
+  } catch (e) {
+    notifLog('close() error', title, e && e.message ? e.message : e);
+  }
+  activeNotifications.delete(nativeNotif);
+}
+
+// Create, show, auto-dismiss and wire up a single native notification.
+// Extracted from the `webContents.on('notification')` handler so the lifecycle
+// can be exercised directly by the regression tests.
+function showNativeNotification(title, body) {
+  notifLog('constructing', title);
+  const nativeNotif = new Notification({
+    title: title,
+    body: body,
+    icon: getRuntimeIconFile('icon.png'),
+    silent: false,
+    // Linux-only: Electron exposes only 'default' (the daemon's own expiry) or
+    // 'never' here — there is NO per-notification millisecond timeout on the
+    // Linux Notification API. The ~5s window is therefore enforced below with
+    // close() on a timer (notify_notification_close), not with a native hint.
+    timeoutType: 'default'
+  });
+
+  // Keep the wrapper alive against V8 GC for the banner's whole lifetime.
+  activeNotifications.add(nativeNotif);
+
+  nativeNotif.on('click', () => {
+    notifLog('click -> restore/focus window', title);
+    dismissNotification(nativeNotif, title, 'click');
+    showAndFocusMainWindow();
+  });
+
+  // 'close' is emitted when the notification is dismissed — by our close()
+  // timer, by the user, or by the daemon. Observe it and release the reference
+  // so `activeNotifications` does not grow without bound.
+  nativeNotif.on('close', () => {
+    notifLog('close event (dismissed by user/daemon)', title);
+    activeNotifications.delete(nativeNotif);
+  });
+
+  nativeNotif.on('show', () => {
+    notifLog('show event (banner visible)', title);
+  });
+
+  // Surface daemon delivery problems instead of failing silently.
+  nativeNotif.on('failed', (ev, error) => {
+    console.error('[notif] failed to display:', title, error);
+    activeNotifications.delete(nativeNotif);
+  });
+
+  notifLog('calling show()', title);
+  nativeNotif.show();
+
+  notifLog('scheduling auto-dismiss in ' + NOTIFICATION_TIMEOUT_MS + 'ms', title);
+  setTimeout(() => {
+    notifLog('auto-dismiss timer fired', title);
+    dismissNotification(nativeNotif, title, 'auto-dismiss timeout');
+  }, NOTIFICATION_TIMEOUT_MS);
+
+  return nativeNotif;
+}
+
 // M7: set true once the app is genuinely quitting so the close-to-tray handler
 // does not intercept the final window close (which would abort the quit).
 let isQuitting = false;
@@ -454,33 +544,7 @@ function createWindow () {
       return;
     }
 
-    const nativeNotif = new Notification({
-      title: title,
-      body: s.notificationPreview ? body : '',
-      icon: getRuntimeIconFile('icon.png'),
-      silent: false
-    });
-
-    // Click -> dismiss the banner and restore/focus the existing window.
-    nativeNotif.on('click', () => {
-      nativeNotif.close();
-      showAndFocusMainWindow();
-    });
-
-    // Surface daemon delivery problems instead of failing silently.
-    nativeNotif.on('failed', (ev, error) => {
-      console.error('Native notification failed to display:', error);
-    });
-
-    nativeNotif.show();
-
-    // Bounded auto-dismiss (~5s). On daemons that already honour a short
-    // default expiry this is a harmless no-op; on daemons that keep banners
-    // up indefinitely it enforces the requirement.
-    setTimeout(() => {
-      try { nativeNotif.close(); } catch (e) { /* already gone */ }
-    }, NOTIFICATION_TIMEOUT_MS);
-
+    showNativeNotification(title, s.notificationPreview ? body : '');
     console.log('Native notification shown:', title, '| unread=', unreadCount);
   });
 
@@ -639,5 +703,8 @@ module.exports = {
   __shouldStartHidden: shouldStartHidden,
   __getAutostartDesktopPath: getAutostartDesktopPath,
   __getAutostartExec: getAutostartExec,
-  __setStartWithSystem: setStartWithSystem
+  __setStartWithSystem: setStartWithSystem,
+  __activeNotifications: activeNotifications,
+  __showNativeNotification: showNativeNotification,
+  __dismissNotification: dismissNotification
 };
