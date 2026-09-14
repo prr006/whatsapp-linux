@@ -1,0 +1,11 @@
+{
+    "uuid": "whatsapp-deterministic-banner@prr006",
+    "name": "WhatsApp for Linux — deterministic notification banners",
+    "description": "For WhatsApp for Linux notifications only: the banner disappears after a fixed ~5 seconds regardless of idle state, pointer position or queue position, while the notification stays in the notification list (history). All other applications keep stock GNOME behaviour.",
+    "shell-version": [
+        "49",
+        "50"
+    ],
+    "version": "1.0.0",
+    "url": "https://github.com/prr006/whatsapp-linux"
+}

@@ -1,0 +1,6 @@
+{
+  "name": "whatsapp-linux-m14-test-harness",
+  "private": true,
+  "type": "module",
+  "description": "ESM marker for the M14 harness/stubs/vendor tree. The repo-root test/*.test.js files remain CommonJS (governed by the root package.json) and simply import this tree."
+}

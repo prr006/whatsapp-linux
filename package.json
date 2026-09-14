@@ -54,6 +54,10 @@
       {
         "from": "build/icons/icon-badge.png",
         "to": "icons/icon-badge.png"
+      },
+      {
+        "from": "gnome-extension",
+        "to": "gnome-extension"
       }
     ]
   },

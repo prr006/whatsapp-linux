@@ -2,7 +2,7 @@
 
 A polished, lightweight Linux desktop client around the official WhatsApp Web experience.
 
-> **Status:** M11 (current) — Linux dock/app-icon unread badge, building on M10 (GNOME banner persistence), M9 (Linux desktop integration, settings, notification polish, release polish), M8 (startup profiling) and M7 (startup + notification UX). The 4–5 s usable / 1–2 s tray figures below were measured on a real machine during M8/M9; **M11 has not yet been run on a real desktop** — see *M11 → Packaged-app verification* for the procedure.
+> **Status:** M14 (current) — deterministic ~5 s GNOME banner presentation with notification-list history preserved, building on M13 (GNOME banner expiry root cause + lifecycle state machine), M12 (notification contract / per-notification identity), M11 (Linux dock/app-icon unread badge), M10 (GNOME banner persistence), M9 (Linux desktop integration, settings, notification polish, release polish), M8 (startup profiling) and M7 (startup + notification UX). The 4–5 s usable / 1–2 s tray figures were measured on a real machine during M8/M9; the on-device M14 confirmation is the documented *M14 → Verification* matrix (this sandbox has no display).
 
 ## Project Goals (from specification)
 - WhatsApp Web login via QR
@@ -31,7 +31,10 @@ A polished, lightweight Linux desktop client around the official WhatsApp Web ex
 - M8 (merged): Startup profiling / cold-start measurement — see below.
 - M9 (merged): Linux integration, settings, notifications & release polish — see below.
 - M10 (merged): GNOME banner persistence fix (`test/m10-gnome-persistence.test.js`).
-- **M11 (current): Linux dock / app-icon unread badge** — see below.
+- M11 (merged): Linux dock / app-icon unread badge — see below.
+- M12 (merged): notification contract — per-notification identity & dedup (`test/m12-notification-contract.test.js`).
+- M13 (merged): GNOME native banner expiration/dismissal — root cause + lifecycle state machine — see below.
+- **M14 (current): deterministic ~5 s GNOME banner presentation, history preserved** — see below.
 
 ## M7 — Startup & Notification UX
 - **Notifications** (see `webContents.on('notification')` in `src/main.js`):
@@ -645,6 +648,235 @@ Useful extra dials while diagnosing on the real desktop:
 `dbus-monitor --session "interface='org.freedesktop.Notifications'"`
 (a lingering banner shows NO `CloseNotification`/`NotificationClosed`
 traffic — the giveaway that GNOME's idle/hover policy is holding it).
+
+## M14 — Deterministic GNOME banner presentation (~5 s) with history preserved
+
+### Requirement
+
+WhatsApp notifications must appear as native GNOME notifications whose
+banner disappears after a fixed ~5 s **regardless of** idle state, queue
+position, rapid bursts or pointer movement — and after the banner
+disappears naturally the notification MUST remain in the GNOME
+notification list. Click still removes exactly that notification and
+focuses WhatsApp. No blind app-side close timer (the M10 regression), no
+custom browser-style popup.
+
+### Investigation (performed in this order, per the mandated plan)
+
+The target desktop is Ubuntu 25.10 → **GNOME Shell 50.1** (Wayland). All
+evidence below is from the **actual 50.1 sources** (GNOME/gnome-shell tag
+`50.1`; the banner file is vendored unmodified at
+`test/m14/vendor/gnome-shell-50.1/messageTray.js`, MD5
+`7ba22e95b5e0c4027a9585567e1bde0b`) and from the **actual Electron
+44.3.0** libnotify sources.
+
+**A) Is there a native GNOME mechanism to control banner lifetime only,
+keeping history?**
+
+- `js/ui/notificationDaemon.js:136` — `NotifyAsync()` destructures the
+  client `expire_timeout` into `timeout_` and **never reads it**. The
+  `org.freedesktop.Notifications` interface (50.1 D-Bus XML) contains only
+  Notify / CloseNotification / GetCapabilities / GetServerInformation and
+  the three signals. **There is no daemon-side knob for banner lifetime.**
+- The `persistence` / `transient` hints (the only per-notification
+  lifetime hints that exist) change **history membership**, not banner
+  timing — and `transient` would *remove* history, violating the
+  requirement. Both are already at the correct values (non-transient).
+- So banner presentation is owned by **GNOME Shell's own message-tray
+  policy** (`js/ui/messageTray.js`), which is not configurable through any
+  public D-Bus or settings API. The shell's own **extension mechanism**
+  is the supported route into it.
+
+**B) What exactly makes the stock lifetime non-deterministic (50.1 lines):**
+
+| Behavior | 50.1 location | Effect |
+| --- | --- | --- |
+| Banner expiry gate | `messageTray.js:1086` | expires only when `_userActiveWhileNotificationShown && state==SHOWN && timerId==0 && urgency!=CRITICAL && !_pointerInNotification` (or `_notificationExpired`) |
+| Idle gate | `messageTray.js:1122` | flag = `idletime <= 1000 ms` at show time → **an idle desktop never expires the banner** (the 4 s timer fires, `_updateState` refuses to hide); it hides ~2 s after the *first* user input |
+| Stock timer value | `messageTray.js:19,1207` | `NOTIFICATION_TIMEOUT = 4000`, armed at show completion |
+| Pointer drift | `messageTray.js:1224-1236` | each timeout check re-arms **+1000 ms** while the pointer is drifting toward the banner / was inside it |
+| Hover | `messageTray.js:985-1011,1095` | pointer inside the expanded banner blocks expiry until it leaves (200/600 ms grace) |
+| Bursts | `messageTray.js:949-971` | queue holds 3 incl. the active banner; overflow is history-only |
+| History on natural hide | `messageTray.js:1273-1284` | `_hideNotificationCompleted` destroys **only `isTransient`** notifications → non-transient banners stay in `source.notifications`; the daemon emits its close signal **only on `destroy`** (`notificationDaemon.js`) |
+| Click | `messageList.js` `vfunc_clicked` | `notification.activate()` → daemon emits `ActionInvoked("default")` + (non-resident) `destroy(DISMISSED)` → close signal for that id only |
+
+This is the layer that was responsible in M10/M13: **the client
+(Electron/libnotify) has no call that changes any of the rows above.**
+M10's blind close timer fixed the symptom by removing history (the
+regression M10 itself removed and M13 pinned); M13 correctly stopped the
+app from touching banner lifetime at all — which is also why the app
+alone can never *guarantee* the ~5 s. The guarantee must come from the
+shell layer.
+
+**C) Can the existing "notification-timeout" extension be reused as-is?**
+
+The widely installed `notification-timeout` extension (targets GNOME
+49/50 — same generation) wraps exactly the choke point below
+(`_updateNotificationTimeout` + the same idle flag), which **confirms the
+hook is stable in production use**. But as shipped it (i) applies to
+*every* application, and (ii) re-arms a **fresh full interval on every
+interaction** (its wrapper unconditionally sets `timeout = newTimeout`),
+so pointer drift / idle→active transitions still push the expiry back —
+not deterministic. So it was used as evidence, not as the solution.
+
+**D) App-owned presentation layer** — rejected: it would be the custom
+popup the requirement forbids, and everything needed turns out to be
+achievable natively.
+
+### Solution (chosen): a small, app-owned GNOME Shell **system extension**
+
+`gnome-extension/` ships `whatsapp-deterministic-banner@prr006`, a
+user-local extension (GNOME 49/50) that governs **only this app's**
+banners — matched on the notification source's resolved desktop app id
+(`whatsapp-linux`, from the `desktop-entry` hint Electron/libnotify set —
+verified in the Electron 44.3.0 sources). It uses the shell's supported
+`InjectionManager` override API on three methods, all of which are the
+shell's own choke points:
+
+1. `_showNotification` (the single point where a queued notification
+   becomes the active banner): for in-scope banners, set
+   `_userActiveWhileNotificationShown = true` — the shell's own flag — so
+   the expiry check is no longer gated by the idle monitor. (Same flag the
+   production extension above sets.)
+2. `_updateNotificationTimeout` (the single point where the banner timer
+   is armed/re-armed — show completion, idle→active watch, pointer
+   checks, hover refresh, pointer-left grace): the **first** positive arm
+   establishes a fixed deadline (`now + 5000 ms`); **every later arm is
+   redirected to `deadline − now`**. All of the shell's interaction-driven
+   re-arms therefore converge on the same instant — no interaction (idle,
+   pointer drift, hover refresh, in-place update) can move the expiry. A
+   re-arm arriving at/after the deadline clears the timer and triggers
+   the shell's own no-re-arm branch.
+3. `_hideNotificationCompleted` (logging only): one journal line per
+   governed banner hide — `path: standard-expiry | removed-while-showing
+   (click/close), history: retained | removed` — plus eager WeakMap
+   cleanup. Zero behavior change; makes the lifetime measurable in the
+   journal (see verification below).
+
+The banner is hidden **exclusively through the shell's standard expiry
+path**, which for non-transient notifications keeps the notification in
+the notification list and stays silent on D-Bus (no close signal) — so
+history, click→`ActionInvoked`→focus, per-notification identity (M12),
+unread accounting, bounded retention (M13), and `timeoutType: 'default'`
+are all untouched. The extension never destroys/closes anything, never
+sends close traffic, and never touches other applications (verified by
+test, both in simulation and by source contract).
+
+**Determinism properties (all asserted in tests):**
+
+- active desktop, no pointer: banner visible ~5.0 s (5.2 s from the
+  D-Bus `Notify` — 200 ms show animation included),
+- idle desktop: same ~5.0 s (the idle gate is lifted by the extension,
+  not by fake activity),
+- burst: at most 3 banners present at once (GNOME's own queue rule); each
+  presented banner holds exactly one 5 s slot, back-to-back; overflow
+  notifications never banner but stay in history,
+- pointer drifting toward the banner at the deadline: still expires at
+  the deadline (the +1 s re-arm is collapsed),
+- hover **at** the deadline: the banner is held while the pointer is
+  inside the expanded banner (GNOME's interaction model — yanking a
+  banner from under an actively reading pointer would break expand/
+  collapse), and hides immediately when the pointer leaves (200/600 ms
+  grace). This is the single documented exemption, bounded by the pointer
+  position, not by time;
+- other applications: byte-for-byte stock behavior (scoping),
+- Escape: still hides the current banner early (user control preserved),
+- click: removes exactly the clicked notification (`ActionInvoked` +
+  `destroy(DISMISSED)` → close signal for that id), the rest keep their
+  banners/history,
+- session BUSY: the current banner hides early (this is *stock* behavior
+  for active users too — BUSY clears the banner timer) and the queue is
+  deferred; history is retained,
+- memory: the governor's per-banner state is a `WeakMap` keyed by the
+  notification object — when the shell evicts a notification (GNOME caps
+  history at 10 per source, unchanged), the governor entry dies with it.
+
+### Files changed (M14)
+
+| File | Change |
+| --- | --- |
+| `gnome-extension/extension.js` | **new** — the governor (3 InjectionManager overrides, scoping, logging) |
+| `gnome-extension/policy.js` | **new** — pure decision logic (scope match, deadline math), Node-testable |
+| `gnome-extension/metadata.json` | **new** — uuid, name, GNOME 49/50, version |
+| `gnome-extension/package.json` | **new** — Node-only `type: module` marker (GJS ignores it) |
+| `src/main.js` | M14 section: best-effort user-local installer (copy + `gnome-extensions enable`) at `app ready`; `__m14` test exports. No timers added anywhere (M13 guard re-asserted) |
+| `package.json` | `extraResources`: ship `gnome-extension/` into packaged apps |
+| `scripts/install-gnome-extension.sh` | **new** — manual install/refresh/uninstall (idempotent) |
+| `scripts/verify-m14.sh` | **new** — on-device verification matrix driver |
+| `test/m14-deterministic-banner.test.js` | **new** — policy unit tests, extension source contracts, installer integration (14 tests) |
+| `test/m14-gnome501-simulation.test.js` | **new** — behavior tests executing the REAL vendored 50.1 `messageTray.js` + the REAL shipped extension (12 tests) |
+| `test/m14/**` | **new** — vendored 50.1 source (with provenance) + GI stubs + harness |
+| `README.md` | this section |
+
+No changes to `src/preload.js`, the renderer, WhatsApp Web DOM/CSS,
+M12 identity, M13 lifecycle state machine, or `timeoutType`.
+
+### Test report (run in this environment)
+
+- `npm test` → **109/109 pass** (97 pre-existing M7–M13 tests + 14 M14
+  contract/installer tests + 12 M14 simulation tests).
+- `node --check src/main.js` → OK; `node --check src/preload.js` → OK;
+  `node --check gnome-extension/{extension.js,policy.js}` → OK.
+- The simulation suite first **calibrates on stock behavior** (governor
+  off): active desktop hides at ~4.4 s; idle desktop does not hide until
+  user activity (+~2 s) — reproducing the exact field reports on the
+  exact 50.1 banner code — and then asserts the governed behavior on the
+  same code. The only stubbed layer is GI/GTK (actors, timers on Node's
+  real event loop, pointer, idle monitor); the state machine, the queue,
+  the history, and the extension are the real code.
+- Honest boundary: this sandbox has no display/GNOME, so the final
+  on-device confirmation is the manual matrix below. The on-device step
+  exercises the same governor code that the simulation runs; the
+  extension's shell-side load (GJS import of `./policy.js`,
+  `InjectionManager` registration) is standard GNOME 49/50 extension
+  behavior but must be confirmed once on the machine.
+
+### Verification on the real machine (A–F matrix)
+
+`scripts/verify-m14.sh` automates B/D/E/F + the out-of-scope control by
+sending notifications through the same D-Bus path the app uses
+(`Notify` with the `desktop-entry: whatsapp-linux` hint) and reads the
+extension's `[m14]` journal lines (exact show/hide timestamps). Run it
+with GNOME up; the gold-standard case is manual:
+
+| # | Scenario | Procedure | Expected |
+| --- | --- | --- | --- |
+| A | **Gold standard** — real message | In the app, receive/send one real chat message | Banner up ~5 s; entry remains in the notification list; clicking it focuses WhatsApp and removes only that entry; journal shows `banner timer established … 5000 ms` then `banner hidden — path: standard-expiry, history: retained` ~5.0–5.3 s apart |
+| B | Single, active desktop | script B (or case A) | one governed banner, ~5.0–5.3 s, history retained |
+| C | Two immediate | send two messages back-to-back (script D covers 3) | two banners, each its own ~5.2 s slot, both in history |
+| D | 3+ burst | script D | three banners (GNOME's 3-slot queue), slots ~5.2 s; a 4th+ is history-only, never banners |
+| E | Idle desktop | script E (don't touch the machine 10 s) | still expires at ~5 s — stock GNOME would keep it until you move |
+| F | Active + pointer motion | script F (mouse drifts toward the banner) | still ~5 s — stock adds ~1 s per pointer check |
+| G | Out-of-scope control | script control (or any other app's notification) | stock ~4.2 s behavior, **no** `[m14]` lines |
+| H | History & click | after any natural expiry: open the notification list | entry present; click removes only it; other entries untouched |
+| I | No regression | use the app as normal for a while | unread badges (M11), per-message identity/dedup (M12), tray quit semantics (M7/M13) all unchanged |
+
+Journal access during the matrix:
+`journalctl --user --since "5 min ago" | grep '\[m14\]'` (the shell logs
+its `log()` output to the user journal on Ubuntu Wayland).
+
+### Disabling / uninstalling
+
+- Temporary: `gnome-extensions disable whatsapp-deterministic-banner@prr006`
+  (stock behavior returns immediately; a running shell picks it up live).
+- Full removal: `scripts/install-gnome-extension.sh --uninstall`.
+- The app re-installs/refreshes the extension on each start **only when
+  the version changed**; a user-disabled but current install is left
+  alone (re-enable it from GNOME Settings → Extensions if needed).
+- Non-GNOME sessions are never touched by the installer.
+
+### Why this is the least-invasive architecture that works
+
+- No app-side timers, no D-Bus spoofing, no custom UI, no DOM changes —
+  the banner is a real GNOME banner, timed by the shell's own expiry path.
+- Scoped to one desktop app id; every other application is untouched
+  (source-verified + tested).
+- Reversible with one command; ships as a plain-file user extension.
+- The alternative — forcing determinism from the client — is impossible
+  on GNOME (the daemon ignores `expire_timeout`; the only client lever,
+  CloseNotification, removes history — the M10 bug). GNOME *can* provide
+  deterministic per-app banner expiration with history preserved; the
+  shell extension mechanism is where that capability lives.
 
 ## Directory Structure
 ```

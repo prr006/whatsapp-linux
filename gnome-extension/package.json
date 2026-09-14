@@ -1,0 +1,6 @@
+{
+  "name": "whatsapp-linux-gnome-extension",
+  "private": true,
+  "type": "module",
+  "description": "Node-only module-type marker so test/m14 can import policy.js as an ES module. GNOME Shell/GJS ignore this file."
+}
