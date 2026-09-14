@@ -5,6 +5,8 @@
 
 const { app, BrowserWindow, Tray, Menu, dialog, shell, Notification, ipcMain, nativeImage } = require('electron');
 const fs = require('fs');
+const os = require('os');
+const { execFile } = require('child_process');
 
 app.setName('whatsapp-linux');
 const path = require('path');
@@ -656,6 +658,181 @@ ipcMain.on(WEB_NOTIFICATION_CHANNEL, (event, payload) => {
   handleWebNotification(payload || {});
 });
 
+// ---------------------------------------------------------------------------
+// M14 — deterministic GNOME banner expiration
+// ---------------------------------------------------------------------------
+//
+// ROOT CAUSE (settled by M13; re-verified against GNOME Shell 50.1 sources,
+// tag 50.1 of GNOME/gnome-shell — see README "M14" for the line-level
+// citations):
+//
+//   Banner presentation and its lifetime are owned by GNOME Shell, not by
+//   the notification daemon protocol, not by Electron/libnotify, and not by
+//   this app:
+//     * js/ui/notificationDaemon.js:136 — NotifyAsync() destructures the
+//       client expire_timeout and NEVER reads it. No supported daemon-side
+//       knob for banner lifetime exists on GNOME (the `persistence`/
+//       `transient` hints change HISTORY membership, not banner timing —
+//       transient would even violate "stay in history").
+//     * js/ui/messageTray.js — the banner is hidden only when its own
+//       NOTIFICATION_TIMEOUT (4000 ms stock) has fired AND the user was
+//       active (line 1122/1086: `_userActiveWhileNotificationShown` gate).
+//       An idle desktop therefore NEVER expires the banner; a pointer
+//       drifting toward it re-arms +1000 ms per check (line 1230); a hover
+//       keeps it up (line 1095). Bursts queue (at most 3 banner candidates
+//       in total — 1 active + 2 queued; overflow is history-only) and each
+//       presented banner gets its own gated timeout. Identical app behaviour,
+//       different shell-side policy outcomes — that is the intermittent
+//       "banner never disappears" behaviour reported since M10, reproduced
+//       with plain notify-send (not WhatsApp-specific).
+//   M10/M13 could not guarantee deterministic banners because no client
+//   call can change that shell-side policy, and the only client-side lever
+//   (CloseNotification / close()) removes the notification from history —
+//   the exact regression M10 removed and M13 pinned against.
+//
+// M14 SOLUTION (least-invasive native mechanism that DOES work):
+//
+//   A small user-local GNOME Shell extension
+//   (whatsapp-deterministic-banner@prr006 — see gnome-extension/) that
+//   governs ONLY this app's banners, using the shell's own supported
+//   extension API (InjectionManager) on the shell's two banner-timer
+//   choke points:
+//     1. _showNotification: for banners whose source is the
+//        `whatsapp-linux` desktop app, mark the user-active flag so the
+//        shell's own expiry check is not gated by the idle monitor;
+//     2. _updateNotificationTimeout: establish a fixed deadline
+//        (~5 s from when the banner becomes fully visible) and redirect
+//        every later re-arm (idle->active, pointer motion, hover refresh)
+//        to that same deadline, so no interaction can move the expiry.
+//   The banner is hidden exclusively through the shell's standard expiry
+//   path, which for non-transient notifications (ours are) keeps the
+//   notification in the notification list and emits NO NotificationClosed
+//   (messageTray.js `_hideNotificationCompleted` destroys only transient
+//   notifications; notificationDaemon.js emits NotificationClosed only on
+//   `destroy`). Click semantics (ActionInvoked -> restore/focus, removal
+//   from history) are untouched, as is M12 renderer identity, unread
+//   accounting, timeoutType 'default', and bounded retention from M13.
+//
+//   Why an extension and not anything in-process: GNOME Shell exposes no
+//   D-Bus or settings API for per-app banner lifetime (verified: the
+//   org.freedesktop.Notifications interface is Notify/CloseNotification/
+//   GetCapabilities/GetServerInformation + the three signals, nothing
+//   else); the shell's own extension mechanism is the supported route, and
+//   the same two choke points are used in production by the widely
+//   installed "Notification Timeout" extension (GNOME 49/50), which this
+//   governor supersedes (scoped to this app; deadline-convergent instead
+//   of re-arming fresh intervals on every interaction).
+//
+// INSTALL (this app, best-effort, user-local, no root):
+//   * source: packaged -> resources/gnome-extension (extraResources),
+//     dev -> repo gnome-extension/
+//   * target: $XDG_DATA_HOME/gnome-shell/extensions/<uuid>
+//             (default ~/.local/share/gnome-shell/extensions/<uuid>)
+//   * enabled via `gnome-extensions enable <uuid>` (idempotent; a running
+//     shell picks it up immediately).
+//   Manual: scripts/install-gnome-extension.sh (--uninstall to remove).
+//   Scope note: on non-GNOME sessions nothing is installed and the stock
+//   banner policy simply applies. The extension matches on the source's
+//   resolved desktop app id (`whatsapp-linux`), so notifications from any
+//   other application keep their stock behaviour.
+
+const M14_EXTENSION_UUID = 'whatsapp-deterministic-banner@prr006';
+const M14_EXTENSION_VERSION = '1.0.0';
+const M14_EXTENSION_FILES = ['metadata.json', 'extension.js', 'policy.js', 'package.json'];
+const M14_STAMP_FILE = '.m14-install-version';
+
+function m14Log(...args) {
+  console.log('[m14]', ...args);
+}
+
+// Where the extension files ship from. Packaged apps carry them via
+// electron-builder extraResources (see package.json); dev runs use the
+// repository directory.
+function m14ExtensionSourceDir() {
+  if (app.isPackaged) {
+    return path.join(process.resourcesPath || '', 'gnome-extension');
+  }
+  return path.join(__dirname, '..', 'gnome-extension');
+}
+
+// Only act on real GNOME sessions; never touch other desktops.
+function m14IsGnomeSession() {
+  if (process.platform !== 'linux') return false;
+  const desktops = [process.env.XDG_CURRENT_DESKTOP, process.env.XDG_SESSION_DESKTOP].join(' ');
+  if (/gnome/i.test(desktops)) return true;
+  if (process.env.GNOME_SHELL_VERSION) return true;
+  return false;
+}
+
+function m14ExtensionTargetDir() {
+  const dataHome = process.env.XDG_DATA_HOME || path.join(os.homedir(), '.local', 'share');
+  return path.join(dataHome, 'gnome-shell', 'extensions', M14_EXTENSION_UUID);
+}
+
+function m14ReadStamp(dir) {
+  try {
+    return fs.readFileSync(path.join(dir, M14_STAMP_FILE), 'utf8').trim();
+  } catch (e) {
+    return null;
+  }
+}
+
+function m14EnableExtension() {
+  // Best-effort: enable idempotently. A running shell reacts to the
+  // enabled-extensions change immediately (no logout required). Errors are
+  // logged, never fatal — the extension can always be enabled manually.
+  execFile('gnome-extensions', ['enable', M14_EXTENSION_UUID], (err, stdout, stderr) => {
+    if (err) {
+      m14Log('enable skipped/failed:', err.code === 'ENOENT'
+        ? 'gnome-extensions CLI not found (enable from Settings > Extensions)'
+        : (err.message || String(err)), (stderr || '').toString().trim());
+    } else {
+      m14Log('enabled:', M14_EXTENSION_UUID);
+    }
+  });
+}
+
+/**
+ * Install (or refresh) the deterministic-banner extension and enable it.
+ * Returns a small result object for logging/tests:
+ *   { action: 'installed' | 'up-to-date' | 'skipped', reason?, dir? }
+ * Safe to call more than once; idempotent per version.
+ */
+function m14EnsureBannerExtension(reason) {
+  if (!m14IsGnomeSession()) {
+    return { action: 'skipped', reason: 'not a GNOME session' };
+  }
+  const srcDir = m14ExtensionSourceDir();
+  const entry = path.join(srcDir, 'extension.js');
+  if (!fs.existsSync(entry)) {
+    m14Log('extension source missing at', srcDir, '(packaging error?)');
+    return { action: 'skipped', reason: 'source missing: ' + srcDir };
+  }
+  const dir = m14ExtensionTargetDir();
+  const upToDate =
+    m14ReadStamp(dir) === M14_EXTENSION_VERSION &&
+    M14_EXTENSION_FILES.every((f) => fs.existsSync(path.join(dir, f)));
+  if (upToDate) {
+    m14Log('banner extension up-to-date (' + M14_EXTENSION_VERSION + ') at ' + dir, '(reason: ' + (reason || 'startup') + ')');
+    return { action: 'up-to-date', dir };
+  }
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    for (const f of M14_EXTENSION_FILES) {
+      fs.copyFileSync(path.join(srcDir, f), path.join(dir, f));
+    }
+    fs.writeFileSync(path.join(dir, M14_STAMP_FILE), M14_EXTENSION_VERSION + '\n');
+    m14Log('installed banner extension ' + M14_EXTENSION_UUID +
+      ' v' + M14_EXTENSION_VERSION + ' at ' + dir + ' (reason: ' + (reason || 'startup') + ')');
+    m14EnableExtension();
+    return { action: 'installed', dir };
+  } catch (e) {
+    m14Log('install failed (manual: scripts/install-gnome-extension.sh):',
+      e && e.message ? e.message : e);
+    return { action: 'skipped', reason: 'install failed: ' + (e && e.message || e) };
+  }
+}
+
 // M7: set true once the app is genuinely quitting so the close-to-tray handler
 // does not intercept the final window close (which would abort the quit).
 let isQuitting = false;
@@ -1249,6 +1426,10 @@ function createTray () {
 
 app.whenReady().then(() => {
   perfLog('app ready');
+  // M14: install/refresh the deterministic-banner GNOME extension before the
+  // first notification can arrive. Best-effort and fast (a few tiny file
+  // copies at most); non-GNOME sessions are skipped. Never blocks startup.
+  m14EnsureBannerExtension('app ready');
   createWindow();
   try {
     createTray();
@@ -1290,10 +1471,10 @@ app.on('before-quit', () => {
   console.log('WhatsApp for Linux shutting down');
 });
 
-// M8/M9/M11/M13: export internals for the mocked-Electron test harness
+// M8/M9/M11/M13/M14: export internals for the mocked-Electron test harness
 // (test/m7-lifecycle.test.js, test/m9-linux-integration.test.js,
 //  test/m10-gnome-persistence.test.js, test/m11-dock-badge.test.js,
-//  test/m13-banner-lifecycle.test.js).
+//  test/m13-banner-lifecycle.test.js, test/m14-deterministic-banner.test.js).
 // Electron ignores main-process exports.
 module.exports = {
   __perfStartMs: PERF_START_MS,
@@ -1315,6 +1496,17 @@ module.exports = {
   __notificationLifecycleLog: NOTIFICATION_LIFECYCLE_LOG,
   __enforceActiveNotificationCap: enforceActiveNotificationCap,
   __recordLifecycle: recordLifecycle,
+  // M14: deterministic GNOME banner expiration (extension install)
+  __m14: {
+    extensionUuid: M14_EXTENSION_UUID,
+    extensionVersion: M14_EXTENSION_VERSION,
+    extensionFiles: M14_EXTENSION_FILES,
+    stampFile: M14_STAMP_FILE,
+    isGnomeSession: m14IsGnomeSession,
+    extensionSourceDir: m14ExtensionSourceDir,
+    extensionTargetDir: m14ExtensionTargetDir,
+    ensureBannerExtension: m14EnsureBannerExtension
+  },
   // M11: dock/app-icon unread badge
   __desktopFileId: DESKTOP_FILE_ID,
   __badgeUpdates: BADGE_UPDATES,
