@@ -487,6 +487,165 @@ grep '\[badge\]' /tmp/whatsapp-badge.log
 # "skip app.setBadgeCount(1): not linux (...)"             -> not running on Linux.
 ```
 
+## M13 — GNOME native banner expiration/dismissal (root cause + lifecycle state machine)
+
+### Symptom
+
+With the packaged Electron 44.3.0 app on GNOME Shell (Wayland, notification
+timeout extension ≈ 5 s), native notifications use `timeoutType: 'default'`
+and the app never calls `close()` on a timer. Intended flow: message →
+banner → GNOME's configured timeout expires → banner disappears naturally →
+notification stays in the GNOME notification list. Observed: *some* banners
+expire on time, others sometimes linger indefinitely. Intermittent, hard to
+reproduce deterministically.
+
+### Root cause (verified against sources, 2026-09-14)
+
+**The inconsistency originates in GNOME Shell's banner-timeout policy, not in
+Electron, libnotify, ids/tags, replacement/append, GC, or our callbacks.**
+Sources read: Electron v44.3.0
+`shell/browser/notifications/linux/libnotify_notification.cc` +
+`shell/browser/api/electron_api_notification.cc` +
+`shell/browser/notifications/notification{,_presenter}.cc`, libnotify
+`notification.c`/`notify.c`, GNOME Shell `js/ui/messageTray.js` +
+`js/ui/notificationDaemon.js`.
+
+1. **GNOME never reads the client timeout.** `NotifyAsync()` destructures the
+   `expire_timeout` argument into `timeout_` and never uses it. Banner
+   lifetime is the shell's own `NOTIFICATION_TIMEOUT` (stock ≈ 4 s; the
+   notification-timeout extension is what makes it ≈ 5 s here). So
+   `timeoutType: 'default'` (→ `NOTIFY_EXPIRES_DEFAULT`) is still correct —
+   it simply means "GNOME decides".
+2. **The timeout only runs while the user is ACTIVE.**
+   `MessageTray._showNotification()` arms it only when
+   `idleMonitor.get_idletime() <= 1000 ms`
+   (`_userActiveWhileNotificationShown`). If the user is idle when the banner
+   pops, **no timer is armed at all** — the banner stays visible indefinitely
+   and disappears only ~2 s after input resumes
+   (`_onIdleMonitorBecameActive → _updateNotificationTimeout(2000)`).
+3. **Pointer behaviour pauses/refreshes the timer**: hovering the banner
+   keeps it expanded; the timer re-arms +1 s while the pointer moves towards
+   it (`_notificationTimeout()`). Banners are also deferred while the session
+   is BUSY or the monitor fullscreen.
+4. **Banners queue**: one banner at a time plus a queue of
+   `MAX_NOTIFICATIONS_IN_QUEUE = 3`; a burst of messages plays banners
+   back-to-back (looks like one banner "that won't go away"); beyond the
+   queue only a panel indicator appears.
+5. **Expiration is unobservable by design.** When the banner hides,
+   `_hideNotificationCompleted()` destroys only *transient* notifications;
+   persistent ones stay in the source's list and **no `NotificationClosed`
+   D-Bus signal is emitted** — so libnotify emits no `closed` GObject signal
+   and Electron can deliver no JS event. The `NotificationClosed` signal (and
+   therefore Electron's `'close'` event) arrives only for: user
+   dismissal/clear from the notification list (reason 2), our own
+   `CloseNotification` (reason 3), and GNOME evicting the oldest once a
+   source accumulates > `MAX_NOTIFICATIONS_PER_SOURCE = 10` entries
+   (reason 1). The reason code itself never reaches JS on the Linux path.
+
+Ruled out along the way: *replacement/append* (Electron only sets a replaces
+id from `options.tag`, which its `Show()` never populates from any JS option,
+and GNOME doesn't advertise the `append` capability Electron checks for —
+every message is an independent notification with a fresh server id); *GC*
+(collecting the gin-weak JS wrapper only calls `set_delegate(nullptr)`, which
+kills JS event delivery but sends nothing to the daemon — hence the M9 strong
+references remain necessary for clicks); *our callbacks* (none can delay a
+GNOME timer).
+
+### Why the M10 model was insufficient
+
+M10 correctly removed the blind `setTimeout(() => close(), 5000)` (which
+issued `CloseNotification` and wiped history) and kept strong references for
+click delivery — that part is preserved. But it retained every notification
+in an **unbounded `Set` with no state**:
+
+- no way to tell *why* a notification ended (user dismissal vs our close vs
+  click), so a lingering banner could not be diagnosed from `[notif]` logs;
+- no bound on retention: notifications whose `close` event never arrives
+  (user never clears them; shell/extension restarts drop in-flight state;
+  non-GNOME daemons without a 10-per-source cap) leaked wrappers forever;
+- the fact that banner expiration is fundamentally unobservable was never
+  documented, inviting misdiagnosis (e.g. "re-add a timer").
+
+### Implementation (`src/main.js`)
+
+- **Per-notification lifecycle state machine** (`NOTIF_STATE`):
+  `created → shown`, then exactly one terminal outcome among
+  `clicked`, `closed-programmatic`, `closed-user-or-daemon`, `failed` —
+  plus `evicted` for retention-cap releases. There is deliberately **no
+  `expired` state**: absence of events is never claimed as expiration.
+- **Close-origin classification**: `dismissNotification()` marks the record
+  (`closingByUs`/`closeReason`) before `close()`, so a `'close'` event is
+  read as either the echo of our own `CloseNotification` or — if we never
+  called `close()` — a user dismissal / daemon eviction. Late events after
+  release are logged no-ops; nothing is double-counted.
+- **Bounded retention**: `activeNotifications` is now a `Map(wrapper →
+  record)` capped at `MAX_ACTIVE_NOTIFICATIONS = 50`, oldest-first eviction
+  (`enforceActiveNotificationCap`). On GNOME the daemon's own 10-per-source
+  cap keeps steady state around 10 live wrappers; the app-side cap is the
+  backstop against daemons with unlimited history and against lost `close`
+  events. Evicted wrappers keep their GNOME entry but lose JS click delivery
+  (documented trade-off).
+- **`[notif]` diagnostics** around creation, `show()` call, native `show`
+  event, click, close (with origin), failed, eviction, and renderer recalls;
+  plus a bounded in-memory transition ring (`__notificationLifecycleLog`).
+- Preserved: `timeoutType: 'default'`, no timers anywhere in `main.js`, no
+  `resident`/`transient` hints, M12 renderer-id dedup (tags stay metadata),
+  click → restore/focus, unread semantics, renderer `Notification.close()`
+  recall.
+
+### Manual verification (packaged app, real GNOME desktop)
+
+The prebuilt Electron binary cannot be downloaded in this sandbox
+(see Known Issues), so run this on a machine with normal egress and a real
+GNOME session:
+
+```bash
+npm run dist            # or: npm run pack
+./dist/<binary> 2>&1 | tee /tmp/wa-m13.log
+grep '\[notif\]' /tmp/wa-m13.log
+```
+
+Scenarios (compare runs instead of trusting a single observation):
+
+- **A — one notification, expires normally**: send one message while you keep
+  moving the mouse / stay active. Banner appears and hides after the
+  configured timeout. Log: `native created … calling native show … native
+  show event … banner expires via GNOME timeout; history retained …` and then
+  **nothing** (no `native closed`, no `close()` — that is correct).
+- **B — several notifications close together**: send 3–4 messages quickly.
+  GNOME shows one banner at a time and plays the rest from its queue; each
+  hides after its own timeout. Log: one created/shown chain per message.
+- **C — different texts close together**: as B with different senders/bodies;
+  verify no coalescing (`native created id=…` once per message, distinct ids).
+- **D — repeated identical messages**: same text twice. With the preload shim
+  each renderer event has a unique id → two independent notifications (no
+  collapse). Only a *replayed* renderer id logs `duplicate suppressed id=…`.
+- **E — click one notification while others exist**: click a banner while
+  more are queued/in history. Window restores+focuses, `native clicked id=…`
+  + `dismissing id=… (click)` for that id only; the other ids are untouched.
+- **F — history retention**: after a banner expires naturally, open the GNOME
+  notification list (Super+V / clock) — the notification is still there.
+  Dismiss it there → log shows `native closed id=… origin=user-or-daemon`
+  (no `close()` from us). A renderer-side recall instead logs
+  `programmatic close id=… (renderer close)`.
+
+**Reproducing the "stuck banner" case on purpose** — and proving it is GNOME
+policy, not the app: send a message, then do not touch mouse/keyboard for
+30+ s. The banner lingers (GNOME arms no timeout for an idle user). Now wiggle
+the mouse: the banner hides ~2 s later. The `[notif]` log throughout shows no
+`close()` and no `close` event — exactly the unobservable-expiration design.
+Contrast with the normal run (A): identical app-side log lines; the only
+difference is GNOME's idle state at pop-out. That comparison is the proof the
+fix is on the right layer — the app cannot and must not force expiration,
+because `CloseNotification` would remove the notification from history (the
+pre-M10 bug).
+
+Useful extra dials while diagnosing on the real desktop:
+`ELECTRON_DEBUG_NOTIFICATIONS=1` (Electron's own notification tracing) and
+`dbus-monitor --session "interface='org.freedesktop.Notifications'"`
+(a lingering banner shows NO `CloseNotification`/`NotificationClosed`
+traffic — the giveaway that GNOME's idle/hover policy is holding it).
+
 ## Directory Structure
 ```
 whatsapp-linux/
@@ -503,7 +662,9 @@ whatsapp-linux/
 │   ├── m9-linux-integration.test.js# M9 desktop identity, autostart, start-minimized, notification edge cases
 │   ├── m10-gnome-persistence.test.js # M10 banner expiration vs GNOME history removal
 │   ├── m11-dock-badge.test.js      # M11 dock badge state transitions + desktop identity
-│   └── m11-dock-badge-no-tray.test.js # M11 badge survives a tray-init failure
+│   ├── m11-dock-badge-no-tray.test.js # M11 badge survives a tray-init failure
+│   ├── m12-notification-contract.test.js # M12 renderer-event identity + lifecycle contracts
+│   └── m13-banner-lifecycle.test.js # M13 banner expiration/dismissal state machine
 ├── build/
 │   ├── icons/icon.png  # App icon (AI-generated)
 │   └── whatsapp-linux.desktop
@@ -525,7 +686,7 @@ npm run dist   # AppImage / deb (electron-builder)
 
 ## Test
 ```bash
-npm test       # node --test test/*.test.js — 60 tests, mocked Electron, no display needed
+npm test       # node --test test/*.test.js — 83 tests, mocked Electron, no display needed
 ```
 
 ## Testing Protocol (per instructions)

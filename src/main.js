@@ -132,33 +132,236 @@ const seenRendererEvents = new Map();
 let nextFallbackNotificationId = 0;
 const MAX_EVENT_RECORDS = 1000;
 
-// M9 bugfix: strong references to every live native notification.
+// ---------------------------------------------------------------------------
+// M13 — native notification lifecycle state machine (banner expiration
+// investigation + bounded retention). Replaces M9/M10's bare Set of strong
+// references with per-notification state, so that the four terminal outcomes
+// are explicitly distinguished:
 //
-// Electron's `Notification` is a thin JS wrapper around the libnotify object;
-// the JS wrapper only holds a WeakPtr to the native side. If the JS object is
-// garbage collected, Electron calls `set_delegate(nullptr)` on the native
-// notification, after which the `click` event can no longer be delivered to JS
-// (so `showAndFocusMainWindow()` never runs) — the canonical "Linux
-// notification click does nothing" failure. Retaining each notification here,
-// and releasing it only on click / daemon close / failure, keeps click
-// delivery alive for the banner's entire visible lifetime (and now for the
-// full GNOME history lifetime, see M10 below).
-const activeNotifications = new Set();
+//   banner expiration      — GNOME hides the pop-out after ITS OWN timeout.
+//                            No event exists for this anywhere in the
+//                            Electron/libnotify/GNOME chain (verified below);
+//                            the notification moves to the history list. We
+//                            must NOT infer expiration from a missing event.
+//   user dismissal         — the user dismisses/clears it from GNOME's
+//                            notification list -> the daemon emits
+//                            NotificationClosed -> Electron 'close' event
+//                            WITHOUT any close() call on our side.
+//   programmatic close     — WE called close() (renderer-side
+//                            Notification.close() recall, or the close we
+//                            issue as part of handling a click).
+//   click-triggered close  — ActionInvoked "default" -> Electron 'click';
+//                            GNOME itself removes non-resident notifications
+//                            on activation, and we additionally issue close().
+//
+// INVESTIGATION (Electron 44.3.0 + libnotify + GNOME Shell, sources read):
+//
+// 1. Electron shell/browser/notifications/linux/libnotify_notification.cc
+//    (v44.3.0):
+//      - Show(): notify_notification_new() + set_timeout(NOTIFY_EXPIRES_DEFAULT
+//        for timeoutType 'default') + notify_notification_show(). The replaces
+//        id is only set when `options.tag` is non-empty (g_quark_from_string
+//        -> g_object_set "id"), but electron_api_notification.cc Show() never
+//        populates NotificationOptions::tag from any JS option, so every
+//        Electron notification is sent with replaces_id = 0 => GNOME always
+//        allocates a NEW server id. There is no replacement/reuse of ids.
+//      - The "append" hint is only set when the server advertises the
+//        "append" capability; GNOME Shell does not (its GetCapabilities lists
+//        actions/body/body-markup/icon-static/persistence/sound only), so no
+//        appending/coalescing happens on GNOME either.
+//      - OnNotificationClosed -> NotificationDismissed(!on_dismissing_) ->
+//        JS 'close'. OnNotificationView -> JS 'click'. notify_notification_show
+//        error -> NotificationFailed -> JS 'failed'.
+// 2. libnotify (notification.c / notify.c):
+//      - notify_notification_show() sends Notify with replaces_id = priv->id
+//        (0 for a fresh object) and the client timeout as the last argument.
+//      - notify_notification_close() is a synchronous CloseNotification D-Bus
+//        call; it does NOT emit the "closed" GObject signal itself.
+//      - The "closed" signal is emitted ONLY when the daemon's
+//        NotificationClosed D-Bus signal is routed to the matching id
+//        (proxy_g_signal_cb -> close_notification()), guarded so it fires at
+//        most once per notification. Consequences: (a) our own close() can be
+//        echoed by a single late 'close' event; (b) anything GNOME never
+//        closes never produces 'closed'.
+// 3. GNOME Shell (js/ui/notificationDaemon.js + js/ui/messageTray.js):
+//      - NotifyAsync() destructures the client timeout into `timeout_` and
+//        NEVER READS IT. Banner lifetime is entirely GNOME's own
+//        NOTIFICATION_TIMEOUT (~4s stock; the notification-timeout extension
+//        is what sets the ~5s on the test machine). timeoutType 'default' is
+//        still correct — it just means "GNOME decides".
+//      - MessageTray only arms that timeout when the user is ACTIVE:
+//        _showNotification() records _userActiveWhileNotificationShown =
+//        (idleMonitor.get_idletime() <= IDLE_TIME /* 1000 ms */). If the user
+//        is idle when the banner pops, NO expiration timer is armed — the
+//        banner stays visible indefinitely and is hidden only ~2s after input
+//        resumes (_onIdleMonitorBecameActive -> _updateNotificationTimeout(2000)).
+//      - The timer is also refreshed/paused while the pointer hovers the
+//        banner or moves towards it (_notificationTimeout() re-arms +1000 ms;
+//        hover keeps it expanded), and banners are suppressed/deferred while
+//        the session is BUSY or the monitor is fullscreen.
+//      - Only ONE banner shows at a time; further notifications are QUEUED
+//        (MAX_NOTIFICATIONS_IN_QUEUE = 3) and shown back-to-back, each with
+//        its own timeout. Beyond the queue only a panel indicator appears.
+//      - Banner expiration of a NON-transient notification destroys NOTHING:
+//        _hideNotificationCompleted() only destroys isTransient ones. The
+//        notification stays in the source's list (history) and NO
+//        NotificationClosed is emitted. NotificationClosed is emitted only
+//        when the notification object is destroyed: user dismissal/clear
+//        (reason DISMISSED=2), our CloseNotification (reason APP_CLOSED=3),
+//        or GNOME evicting the oldest once a source accumulates more than
+//        MAX_NOTIFICATIONS_PER_SOURCE = 10 notifications (reason EXPIRED=1).
+//
+// ROOT CAUSE of the inconsistent banner expiration seen on the real packaged
+// app: GNOME Shell's timeout policy (item 3). With identical app behaviour the
+// banner expires normally in one case (user active, pointer elsewhere) but
+// lingers indefinitely in another (user idle at pop-out, pointer hovering /
+// drifting towards the banner, session busy, or the notification is deep in
+// the banner queue behind a burst of messages). That intermittency is by
+// GNOME design; no client call can change it, and — critically — it must NOT
+// be "fixed" with CloseNotification, which would remove the notification from
+// history (the original M10 bug).
+//
+// WHY THE M10 MODEL WAS INSUFFICIENT (although its tests passed):
+//   - It had no per-notification state: every outcome other than "reference
+//     present" was invisible, so a lingering banner could not be diagnosed
+//     from [notif] logs and close origins were indistinguishable.
+//   - activeNotifications was an UNBOUNDED Set held until click/close. On
+//     GNOME the daemon's own 10-per-source cap normally recycles entries via
+//     real 'close' events, but the app-side retention had no bound and no
+//     defence against daemons without such a cap or against close events that
+//     never arrive (shell/extension restart, name-owner churn) — a slow
+//     main-process memory leak.
+//   - It never documented that banner expiration is fundamentally
+//     unobservable, inviting exactly the misdiagnosis this milestone settles.
+//
+// WHY THE OTHER SUSPECTS WERE RULED OUT:
+//   - GC / wrapper lifetime: Electron's JS Notification wrapper is
+//     gin-wrapped (weak); collecting it only calls set_delegate(nullptr)
+//     (electron_api_notification.cc ~Notification). That breaks JS event
+//     delivery but sends nothing to the daemon, so it cannot hold a banner.
+//     (M9's strong references remain necessary for click delivery.)
+//   - Replacement/append/id/tag: verified impossible above (replaces_id is
+//     always 0; no append hint on GNOME; tag never reaches libnotify).
+//   - Our lifecycle callbacks: none of them can delay a GNOME timer, and M10
+//     already removed the only thing that actively harmed history (the blind
+//     5 s close() timer). The remaining app-side gaps were observability and
+//     unbounded retention, which this milestone fixes.
+//
+// DESIGN (around OBSERVABLE behaviour — no invented expiration event, no
+// blind timers):
+//   - Each native notification gets a lifecycle record (state machine below).
+//   - 'show' / 'click' / 'close' / 'failed' map to explicit transitions; the
+//     close origin is classified by whether WE initiated close().
+//   - Banner expiration produces no transition; the record simply stays
+//     'shown' and the reference is retained so a later click from GNOME's
+//     history list still restores the window. We never claim expiration.
+//   - Retention is BOUNDED (MAX_ACTIVE_NOTIFICATIONS): oldest tracked
+//     wrappers are evicted when the cap is exceeded. On GNOME this cap is a
+//     backstop only (the daemon keeps at most 10 of ours alive anyway); on
+//     daemons with unlimited retention it trades click-to-restore for very
+//     old history entries against unbounded memory growth.
+// ---------------------------------------------------------------------------
+
+// M9 bugfix (kept, now bounded): strong references to every live native
+// notification, so the gin-weak Electron wrapper cannot be GC'd while the
+// banner/history entry is still clickable (GC -> set_delegate(nullptr) ->
+// click never reaches JS -> showAndFocusMainWindow() never runs). Keyed
+// wrapper -> lifecycle record (M13); .has/.size/.clear/.delete semantics are
+// unchanged for callers/tests.
+const activeNotifications = new Map();
+
+// Defensive upper bound on simultaneously retained native notifications.
+// GNOME itself retains at most 10 notifications per source
+// (MAX_NOTIFICATIONS_PER_SOURCE in messageTray.js, oldest evicted with a real
+// NotificationClosed), so on the target desktop steady-state retention is
+// ~10; the cap protects against daemons with unlimited history and against
+// close events that are lost (shell restart/extension reload).
+const MAX_ACTIVE_NOTIFICATIONS = 50;
+
+// Lifecycle states for a native notification. EXPIRED deliberately does NOT
+// exist: expiration is unobservable on GNOME and we do not fabricate it.
+const NOTIF_STATE = Object.freeze({
+  CREATED: 'created',                         // Notification constructed
+  SHOWN: 'shown',                             // 'show' event: delivered to daemon
+  CLICKED: 'clicked',                         // 'click' event (terminal)
+  CLOSED_PROGRAMMATIC: 'closed-programmatic', // we called close() (terminal)
+  CLOSED_USER_OR_DAEMON: 'closed-user-or-daemon', // daemon 'close' w/o our close() (terminal)
+  FAILED: 'failed',                           // 'failed' event (terminal)
+  EVICTED: 'evicted'                          // released by the retention cap
+});
 
 // Diagnostic logging for the notification path. Prefixed `[notif]` so the real
-// packaged-desktop run can be traced with `grep '[notif]'` (see the manual
-// verification procedure in the M9 bugfix notes / README).
+// packaged-desktop run can be traced with `grep '\[notif\]'` (see the manual
+// verification procedure in the README M13 section).
 function notifLog(...args) {
   console.log('[notif]', ...args);
+}
+
+// Bounded, in-memory ring of lifecycle transitions. Lets the mocked tests
+// assert the exact transition sequence and gives on-device debugging a
+// machine-readable trail without parsing log lines. Newest last.
+const NOTIFICATION_LIFECYCLE_LOG = [];
+const MAX_LIFECYCLE_LOG_ENTRIES = 256;
+
+function recordLifecycle(eventId, transition, detail) {
+  const entry = {
+    eventId: eventId,
+    transition: transition,
+    detail: detail || '',
+    atMs: Date.now()
+  };
+  NOTIFICATION_LIFECYCLE_LOG.push(entry);
+  if (NOTIFICATION_LIFECYCLE_LOG.length > MAX_LIFECYCLE_LOG_ENTRIES) {
+    NOTIFICATION_LIFECYCLE_LOG.splice(
+      0, NOTIFICATION_LIFECYCLE_LOG.length - MAX_LIFECYCLE_LOG_ENTRIES);
+  }
+  return entry;
+}
+
+// Release the oldest tracked wrappers once the cap is exceeded. Eviction only
+// drops OUR reference: the daemon still owns whatever it is showing/storing.
+// The trade-off (documented on the M13 block above) is that a wrapper evicted
+// while its history entry still exists can no longer deliver 'click' to JS.
+function enforceActiveNotificationCap() {
+  while (activeNotifications.size > MAX_ACTIVE_NOTIFICATIONS) {
+    const oldest = activeNotifications.keys().next().value;
+    const meta = activeNotifications.get(oldest);
+    activeNotifications.delete(oldest);
+    if (meta) {
+      meta.state = NOTIF_STATE.EVICTED;
+      meta.endedAtMs = Date.now();
+      recordLifecycle(meta.eventId, 'evicted',
+        'retention cap ' + MAX_ACTIVE_NOTIFICATIONS + ' reached; reference released');
+      notifLog('evicted from tracking id=' + meta.eventId +
+        ' reason=retention-cap active=' + activeNotifications.size +
+        ' (GNOME still owns its banner/history; JS click delivery dropped)');
+    }
+  }
 }
 
 // Single place that closes a native notification and releases its strong
 // reference. `close()` maps to libnotify's notify_notification_close()
 // (a CloseNotification DBus request) on Linux, so the daemon owns the final
-// visual dismissal; it is idempotent and safe to call after a click/daemon
-// close has already destroyed the native object.
+// visual removal; it is idempotent and safe to call after a click/daemon
+// close has already destroyed the native object. M13: also finalizes the
+// lifecycle state as 'closed-programmatic' (unless a click already claimed
+// the terminal state) and marks the record so a synchronous 'close' echo from
+// libnotify is classified correctly instead of looking like a user dismissal.
 function dismissNotification(nativeNotif, title, reason) {
   notifLog('dismissing id=' + title + ' (' + reason + ')');
+  const meta = activeNotifications.get(nativeNotif);
+  if (meta) {
+    meta.closingByUs = true;
+    meta.closeReason = reason;
+    if (meta.state !== NOTIF_STATE.CLICKED && meta.state !== NOTIF_STATE.FAILED) {
+      meta.state = NOTIF_STATE.CLOSED_PROGRAMMATIC;
+      meta.endedAtMs = meta.endedAtMs || Date.now();
+      recordLifecycle(meta.eventId, 'closed-programmatic',
+        reason + ' — CloseNotification sent by the app');
+      notifLog('programmatic close id=' + meta.eventId + ' (' + reason + ')' +
+        ' — this removes it from GNOME history, unlike banner expiration');
+    }
+  }
   try {
     nativeNotif.close();
   } catch (e) {
@@ -167,132 +370,171 @@ function dismissNotification(nativeNotif, title, reason) {
   activeNotifications.delete(nativeNotif);
 }
 
-// M10: GNOME banner persistence fix — investigation and new semantics.
+// M10 (kept) + M13: GNOME banner persistence semantics.
 //
-// freedesktop.org Desktop Notifications spec (hints table):
-//   - "resident" BOOLEAN: When set the server will NOT automatically remove
-//     the notification when an action has been invoked. The notification will
-//     remain resident in the server until it is explicitly removed by the user
-//     or by the sender. Useful when server has "persistence" capability.
-//   - "transient" BOOLEAN: When set the server will treat the notification as
-//     transient and by-pass the server's persistence capability, if it should
-//     exist. Transient notifications do NOT stay in history.
-//   - "persistence" capability: The server supports persistence of
-//     notifications. Notifications will be retained until they are acknowledged
-//     or removed by the user or recalled by the sender.
+// Desired behaviour, unchanged from M10 and now enforced by the lifecycle
+// state machine above:
+//   1. Message arrives -> native GNOME notification via Electron/libnotify.
+//   2. Banner shows for GNOME's OWN timeout (timeoutType 'default' ->
+//      NOTIFY_EXPIRES_DEFAULT; note GNOME Shell never even reads the client
+//      timeout — see the M13 investigation block).
+//   3. Banner disappears naturally. This is pure GNOME-side UI: no
+//      CloseNotification, no NotificationClosed D-Bus signal, hence NO JS
+//      event — not 'close', not anything else. We therefore do not (and
+//      cannot) react to expiration, and we never call close() on a timer.
+//      Calling close() here would be CloseNotification and would remove the
+//      notification from history: the original pre-M10 bug.
+//   4. Notification remains in GNOME's notification list/history because it
+//      is neither transient nor resident and nobody closed it
+//      (resident=false -> it DOES go away once the user finally acts).
+//   5. Click (banner or history) -> ActionInvoked "default" -> JS 'click' ->
+//      restore/focus window + close() + reference release.
+//   6. User dismissal from the list / daemon eviction -> NotificationClosed
+//      -> JS 'close' WITHOUT our close() -> reference release.
 //
-// GNOME Shell (https://blogs.gnome.org/marina/2011/01/07/notifications-with-character/):
-//   - Enables persistent notifications by default.
-//   - A new notification is first shown as a pop-out (banner) for a certain
-//     time period (GNOME-configured, ~5s). When the pop-out is hidden, the
-//     notification is still available in the message tray / notification center.
-//   - The notification is only removed when the user interacts with it or
-//     switches to the application that sent it. This default persistent behavior
-//     ensures notifications are less disruptive.
-//   - Resident notifications stay even after interaction (e.g. Rhythmbox with
-//     playback controls). Transient notifications are NOT kept at all after
-//     being shown (e.g. non-critical battery info).
-//
-// Electron 44.3.0 Linux implementation (shell/browser/notifications/linux/libnotify_notification.cc):
-//   - Show():
-//     * notify_notification_new(title, body)
-//     * timeout = NOTIFY_EXPIRES_DEFAULT (-1) when timeoutType='default',
-//       NOTIFY_EXPIRES_NEVER (0) when timeoutType='never'. DEFAULT lets the
-//       server (GNOME) decide the banner timeout (~5s via gsettings).
-//     * Adds action "default" ("View") if server has "actions" capability.
-//     * Does NOT set "resident" or "transient" hints → defaults to
-//       resident=false, transient=false → persistent: banner expires naturally,
-//       stays in history, removed on action/invocation.
-//     * Sets "append" hint if server supports it, plus desktop-entry and sender-pid.
-//   - Dismiss():
-//     * notify_notification_close() → CloseNotification DBus method → server
-//       explicitly removes notification from both banner AND history.
-//   - OnNotificationClosed signal → NotificationDismissed(!on_dismissing_)
-//     distinguishes client-initiated close vs server/user dismissal.
-//   - OnNotificationView → NotificationClicked → our 'click' handler.
-//
-// Previous behavior (M7-M9):
-//   - Created Notification with timeoutType='default' (correct for GNOME timeout)
-//   - BUT also scheduled setTimeout 5000ms → close() → CloseNotification → removed
-//     from history entirely, defeating GNOME persistence.
-//   - User saw banner for 5s, then it vanished with no trace in notification center.
-//
-// Desired (M10):
-//   1. Message arrives → native GNOME notification via Electron/libnotify.
-//   2. Banner remains for GNOME-configured timeout (~5s) via timeoutType='default'.
-//   3. Banner disappears naturally (server hides pop-out, NOT CloseNotification).
-//   4. Notification remains in GNOME notification center/history because it has
-//      NOT been acted upon and we did NOT call CloseNotification.
-//   5. Clicking the notification (banner or history) → ActionInvoked "default"
-//      → Electron click event → restore/focus window + close() to remove from history.
-//   6. After user acts/clicks, notification is removed appropriately via close().
-//   7. Preserve unread count, deduplication, settings, native behavior.
-//
-// Implementation: Do NOT call close() on a timer. Keep strong reference in
-// activeNotifications until click / close / failed, so click delivery stays alive
-// for the full history lifetime (GNOME keeps notification until dismissed).
+// What M13 adds on top:
+//   - per-notification state + [notif] diagnostics distinguishing the four
+//     outcomes (see NOTIF_STATE / dismissNotification / the handlers below);
+//   - bounded retention (enforceActiveNotificationCap) instead of the
+//     unbounded Set, so history-pinned notifications cannot grow the main
+//     process without limit;
+//   - an explicit statement, in logs and code, that banner expiration is
+//     unobservable: absence of events is NOT evidence of expiration.
 function showNativeNotification(title, body, eventRecord) {
   const eventId = eventRecord && eventRecord.id ? eventRecord.id : 'native-' + (++nextFallbackNotificationId);
-  notifLog('native created id=' + eventId + (eventRecord && eventRecord.tag ? ' tag=' + eventRecord.tag : ''));
+  const tag = eventRecord && eventRecord.tag ? eventRecord.tag : '';
+  notifLog('native created id=' + eventId + (tag ? ' tag=' + tag : ''));
   const nativeNotif = new Notification({
     title: title,
     body: body,
     icon: getRuntimeIconFile('icon.png'),
     silent: false,
     // Linux-only: Electron exposes only 'default' (server's own expiry) or
-    // 'never' here — there is NO per-notification millisecond timeout.
-    // 'default' → NOTIFY_EXPIRES_DEFAULT (-1) → GNOME uses its configured
-    // timeout (~5s, gsettings org.gnome.desktop.notifications). The banner
-    // then expires naturally but the notification stays in the center because
-    // we do NOT call close() (which would be CloseNotification and would remove
-    // it from history). This is the freedesktop persistence model.
+    // 'never' here — there is NO per-notification millisecond timeout, and
+    // GNOME Shell ignores the value entirely anyway (M13 investigation).
+    // 'default' -> NOTIFY_EXPIRES_DEFAULT (-1) -> GNOME applies its own
+    // configured banner timeout (~5s here via the notification-timeout
+    // extension). The banner then expires naturally; the notification stays
+    // in history because we never call close() in response (that would be
+    // CloseNotification and would remove it). Freedesktop persistence model.
     timeoutType: 'default'
+    // Deliberately NOT passed (Electron 44 does not wire a JS option into
+    // libnotify's replaces-id anyway): no resident/transient/append hints,
+    // no replaces-id -> every message stays an independent GNOME
+    // notification, persistent (in history) and removed on activation.
   });
 
+  // M13: per-notification lifecycle record (see NOTIF_STATE). All handlers
+  // below close over THIS record only — one notification's lifecycle can
+  // never touch another's.
+  const meta = {
+    eventId: eventId,
+    tag: tag,
+    title: title,
+    state: NOTIF_STATE.CREATED,
+    closingByUs: false,
+    closeReason: null,
+    createdAtMs: Date.now(),
+    shownAtMs: null,
+    endedAtMs: null
+  };
+  recordLifecycle(eventId, 'created',
+    'Notification constructed (timeoutType=default, no timers)' + (tag ? ', tag=' + tag : ''));
+
   // Keep the wrapper alive against V8 GC for the banner's whole lifetime AND
-  // for its persistence in GNOME's notification center. Released only on click
-  // (user acted), daemon/user close, or failure.
-  activeNotifications.add(nativeNotif);
+  // for its persistence in GNOME's notification list. Released only on click,
+  // close, failure, or retention-cap eviction. Bounded via the cap below.
+  activeNotifications.set(nativeNotif, meta);
+  enforceActiveNotificationCap();
 
   nativeNotif.on('click', () => {
-    notifLog('native clicked id=' + eventId);
+    notifLog('native clicked id=' + eventId + ' (ActionInvoked "default")');
+    meta.state = NOTIF_STATE.CLICKED;
+    meta.endedAtMs = Date.now();
+    recordLifecycle(eventId, 'click',
+      'click-triggered close; GNOME also auto-removes non-resident notifications on activation');
     markNotificationRead(eventId, 'native click');
     dismissNotification(nativeNotif, eventId, 'click');
     showAndFocusMainWindow();
   });
 
-  // 'close' is emitted when the notification is dismissed — by our close()
-  // on click, by the user dismissing from the center, or by the daemon.
-  // It is NOT emitted when the banner merely expires in GNOME's persistent
-  // model (banner hides but notification stays in history). We release the
-  // reference here so activeNotifications does not grow without bound.
+  // 'close' is emitted when the daemon reports NotificationClosed for this
+  // notification. Verified observable sources of that signal on GNOME:
+  //   * the user dismissed/cleared it from the notification list (reason 2);
+  //   * WE sent CloseNotification (reason 3) — libnotify may deliver the
+  //     echo during or after our close() call, so dismissNotification marks
+  //     the record and this handler treats marked records as echoes;
+  //   * GNOME evicted it: a source keeps at most 10 notifications, the
+  //     oldest is destroyed with reason 1 when the 11th arrives.
+  // What NEVER produces this event: banner expiration. A missing event is
+  // therefore never logged as expiration — it just means the notification is
+  // presumably still in history.
   nativeNotif.on('close', () => {
-    notifLog('native closed id=' + eventId);
+    const tracked = activeNotifications.get(nativeNotif);
+    if (!tracked) {
+      // Already released: click path, programmatic close, failure, or
+      // retention-cap eviction got there first. Idempotent no-op.
+      notifLog('native closed id=' + eventId +
+        ' after release — expected echo/no-op, state unchanged');
+      recordLifecycle(eventId, 'close-after-release',
+        'NotificationClosed arrived after the reference was released');
+      return;
+    }
     activeNotifications.delete(nativeNotif);
+    tracked.endedAtMs = Date.now();
+    if (tracked.closingByUs) {
+      // Synchronous echo of our own CloseNotification (libnotify routes the
+      // daemon's NotificationClosed back into the "closed" GObject signal).
+      // dismissNotification already finalized the state.
+      notifLog('native closed id=' + eventId + ' origin=programmatic echo (' +
+        (tracked.closeReason || 'unknown') + ') active=' + activeNotifications.size);
+      return;
+    }
+    tracked.state = NOTIF_STATE.CLOSED_USER_OR_DAEMON;
+    recordLifecycle(eventId, 'closed-user-or-daemon',
+      'daemon NotificationClosed without app close(): user dismissal/clear or daemon eviction (10/source cap)');
+    notifLog('native closed id=' + eventId +
+      ' origin=user-or-daemon (no close() from us; NOT banner expiration) active=' +
+      activeNotifications.size);
     // A daemon/user dismissal is not evidence that the WhatsApp message was
     // read; it only releases the native wrapper. Renderer close is handled by
-    // its own lifecycle event below.
+    // its own lifecycle event in handleWebNotification.
   });
 
   nativeNotif.on('show', () => {
+    if (meta.state === NOTIF_STATE.CREATED) {
+      meta.state = NOTIF_STATE.SHOWN;
+      meta.shownAtMs = Date.now();
+      recordLifecycle(eventId, 'shown',
+        'delivered to the notification daemon (Electron "show"; banner visibility itself is GNOME-owned)');
+    }
     notifLog('native show event id=' + eventId);
   });
 
-  // Surface daemon delivery problems instead of failing silently.
+  // Surface daemon delivery problems instead of failing silently. Electron
+  // destroys the platform notification after 'failed', so no further events
+  // can arrive for it; release the reference.
   nativeNotif.on('failed', (ev, error) => {
-    console.error('[notif] failed to display id=' + eventId + ':', error);
+    meta.state = NOTIF_STATE.FAILED;
+    meta.endedAtMs = Date.now();
     activeNotifications.delete(nativeNotif);
+    recordLifecycle(eventId, 'failed',
+      String(error && error.message ? error.message : (error === undefined ? '' : error)));
+    console.error('[notif] failed to display id=' + eventId + ':', error);
+    notifLog('failed path released reference id=' + eventId +
+      ' active=' + activeNotifications.size);
   });
 
   notifLog('calling native show id=' + eventId);
+  recordLifecycle(eventId, 'show-requested', 'Notification.show() -> notify_notification_show');
   nativeNotif.show();
 
-  // No auto-dismiss timer: let GNOME's own timeout hide the banner naturally.
-  // The notification remains in the notification center/history until the user
-  // acts on it (click) or dismisses it, at which point 'close' fires and we
-  // release the reference. Calling close() here would be CloseNotification and
-  // would remove it from history, which is the bug we are fixing.
-  notifLog('banner expires via GNOME timeout; history retained id=' + eventId);
+  // No auto-dismiss timer (M10, kept): GNOME hides the banner on its own
+  // timeout and we must not interfere. NOTE the honesty constraint (M13):
+  // this line states OWNERSHIP, not an observation — no JS event will ever
+  // tell us the banner expired, and we never claim it did.
+  notifLog('banner expires via GNOME timeout; history retained id=' + eventId +
+    ' (expiration is unobservable by design: no JS event arrives for it)');
 
   return nativeNotif;
 }
@@ -1048,9 +1290,10 @@ app.on('before-quit', () => {
   console.log('WhatsApp for Linux shutting down');
 });
 
-// M8/M9/M11: export internals for the mocked-Electron test harness
+// M8/M9/M11/M13: export internals for the mocked-Electron test harness
 // (test/m7-lifecycle.test.js, test/m9-linux-integration.test.js,
-//  test/m10-gnome-persistence.test.js, test/m11-dock-badge.test.js).
+//  test/m10-gnome-persistence.test.js, test/m11-dock-badge.test.js,
+//  test/m13-banner-lifecycle.test.js).
 // Electron ignores main-process exports.
 module.exports = {
   __perfStartMs: PERF_START_MS,
@@ -1066,6 +1309,12 @@ module.exports = {
   __dismissNotification: dismissNotification,
   __notificationEvents: notificationEvents,
   __markNotificationRead: markNotificationRead,
+  // M13: lifecycle state machine / bounded retention
+  __notifState: NOTIF_STATE,
+  __maxActiveNotifications: MAX_ACTIVE_NOTIFICATIONS,
+  __notificationLifecycleLog: NOTIFICATION_LIFECYCLE_LOG,
+  __enforceActiveNotificationCap: enforceActiveNotificationCap,
+  __recordLifecycle: recordLifecycle,
   // M11: dock/app-icon unread badge
   __desktopFileId: DESKTOP_FILE_ID,
   __badgeUpdates: BADGE_UPDATES,
