@@ -124,6 +124,13 @@ let tray = null;
 const recentNotifications = new Map();
 const NOTIFICATION_DEDUP_WINDOW_MS = 3000;
 let unreadCount = 0;
+// Renderer constructor identities are the only reliable duplicate key. Tags
+// are useful metadata, but WhatsApp reuses them for a chat, so they never
+// identify a message by themselves.
+const notificationEvents = new Map();
+const seenRendererEvents = new Map();
+let nextFallbackNotificationId = 0;
+const MAX_EVENT_RECORDS = 1000;
 
 // M9 bugfix: strong references to every live native notification.
 //
@@ -151,7 +158,7 @@ function notifLog(...args) {
 // visual dismissal; it is idempotent and safe to call after a click/daemon
 // close has already destroyed the native object.
 function dismissNotification(nativeNotif, title, reason) {
-  notifLog('dismissing (' + reason + ')', title);
+  notifLog('dismissing id=' + title + ' (' + reason + ')');
   try {
     nativeNotif.close();
   } catch (e) {
@@ -224,8 +231,9 @@ function dismissNotification(nativeNotif, title, reason) {
 // Implementation: Do NOT call close() on a timer. Keep strong reference in
 // activeNotifications until click / close / failed, so click delivery stays alive
 // for the full history lifetime (GNOME keeps notification until dismissed).
-function showNativeNotification(title, body) {
-  notifLog('constructing', title);
+function showNativeNotification(title, body, eventRecord) {
+  const eventId = eventRecord && eventRecord.id ? eventRecord.id : 'native-' + (++nextFallbackNotificationId);
+  notifLog('native created id=' + eventId + (eventRecord && eventRecord.tag ? ' tag=' + eventRecord.tag : ''));
   const nativeNotif = new Notification({
     title: title,
     body: body,
@@ -247,8 +255,9 @@ function showNativeNotification(title, body) {
   activeNotifications.add(nativeNotif);
 
   nativeNotif.on('click', () => {
-    notifLog('click -> restore/focus window', title);
-    dismissNotification(nativeNotif, title, 'click');
+    notifLog('native clicked id=' + eventId);
+    markNotificationRead(eventId, 'native click');
+    dismissNotification(nativeNotif, eventId, 'click');
     showAndFocusMainWindow();
   });
 
@@ -258,21 +267,24 @@ function showNativeNotification(title, body) {
   // model (banner hides but notification stays in history). We release the
   // reference here so activeNotifications does not grow without bound.
   nativeNotif.on('close', () => {
-    notifLog('close event (dismissed by user/daemon or after click)', title);
+    notifLog('native closed id=' + eventId);
     activeNotifications.delete(nativeNotif);
+    // A daemon/user dismissal is not evidence that the WhatsApp message was
+    // read; it only releases the native wrapper. Renderer close is handled by
+    // its own lifecycle event below.
   });
 
   nativeNotif.on('show', () => {
-    notifLog('show event (banner visible)', title);
+    notifLog('native show event id=' + eventId);
   });
 
   // Surface daemon delivery problems instead of failing silently.
   nativeNotif.on('failed', (ev, error) => {
-    console.error('[notif] failed to display:', title, error);
+    console.error('[notif] failed to display id=' + eventId + ':', error);
     activeNotifications.delete(nativeNotif);
   });
 
-  notifLog('calling show()', title);
+  notifLog('calling native show id=' + eventId);
   nativeNotif.show();
 
   // No auto-dismiss timer: let GNOME's own timeout hide the banner naturally.
@@ -280,7 +292,7 @@ function showNativeNotification(title, body) {
   // acts on it (click) or dismisses it, at which point 'close' fires and we
   // release the reference. Calling close() here would be CloseNotification and
   // would remove it from history, which is the bug we are fixing.
-  notifLog('banner will expire via GNOME-configured timeout, remains in history until acted upon', title);
+  notifLog('banner expires via GNOME timeout; history retained id=' + eventId);
 
   return nativeNotif;
 }
@@ -308,37 +320,90 @@ function showNativeNotification(title, body) {
 // restores/focuses the window.
 const WEB_NOTIFICATION_CHANNEL = 'wa-web-notification';
 
+function pruneNotificationEvents() {
+  if (notificationEvents.size <= MAX_EVENT_RECORDS) return;
+  for (const [id, record] of notificationEvents) {
+    if (record.read || notificationEvents.size > MAX_EVENT_RECORDS) notificationEvents.delete(id);
+  }
+}
+
+function markNotificationRead(id, reason) {
+  const record = notificationEvents.get(id);
+  if (!record || record.read) return false;
+  record.read = true;
+  unreadCount = Math.max(0, unreadCount - 1);
+  notifLog('unread transition id=' + id + ' -> read (' + reason + '), count=' + unreadCount);
+  updateUnreadIndicator(reason + ' (unread=' + unreadCount + ')');
+  pruneNotificationEvents();
+  return true;
+}
+
+function handleRendererNotificationClose(notification) {
+  const id = notification && notification.eventId;
+  if (!id) return;
+  const record = notificationEvents.get(id);
+  notifLog('renderer Notification.close received id=' + id);
+  if (record && record.native) {
+    // This is an explicit sender recall, not a banner timeout. It is therefore
+    // correct to remove only this native history item.
+    dismissNotification(record.native, id, 'renderer close');
+    record.native = null;
+  }
+  markNotificationRead(id, 'renderer close');
+}
+
 function handleWebNotification(notification) {
-  // User is already looking at the app: no banner, no unread bump.
-  if (isMainWindowFocused()) {
+  const lifecycle = notification && notification.lifecycle ? notification.lifecycle : 'constructor';
+  if (lifecycle === 'close') {
+    handleRendererNotificationClose(notification);
     return;
   }
+
+  // User is already looking at the app: no banner and no unread event. This is
+  // a real read-state signal, unlike focusing a hidden window later.
+  if (isMainWindowFocused()) return;
 
   const title = (notification && notification.title) || 'WhatsApp';
   const body = (notification && notification.body) || '';
+  const rendererId = notification && typeof notification.eventId === 'string'
+    ? notification.eventId : '';
+  const tag = notification && typeof notification.tag === 'string' ? notification.tag : '';
 
-  // Dedup key: title + first 50 chars of body.
-  const dedupKey = title + '|' + body.substring(0, 50);
-  if (isDuplicate(dedupKey)) {
-    console.log('Notification suppressed (duplicate):', title);
+  // Only an explicitly repeated renderer event is a proven duplicate. The
+  // legacy no-ID path retains M11 compatibility; it is intentionally not used
+  // by the preload shim, which assigns every constructor a unique id.
+  if (rendererId && seenRendererEvents.has(rendererId)) {
+    notifLog('duplicate suppressed id=' + rendererId + (tag ? ' tag=' + tag : ''));
+    return;
+  }
+  if (rendererId) {
+    const now = Date.now();
+    seenRendererEvents.set(rendererId, now);
+    for (const [seenId, seenAt] of seenRendererEvents) {
+      if (now - seenAt > NOTIFICATION_DEDUP_WINDOW_MS) seenRendererEvents.delete(seenId);
+    }
+  } else if (isDuplicate(title + '|' + body.substring(0, 50))) {
+    notifLog('legacy duplicate suppressed (no renderer id)');
     return;
   }
 
-  // Count as unread regardless of the notification toggle (keeps M2/M3
-  // tray badge/tooltip behaviour intact even when banners are disabled, and
-  // M11 keeps the dock badge on the same counter).
+  const id = rendererId || 'fallback-' + (++nextFallbackNotificationId);
+  const record = { id: id, tag: tag, title: title, read: false, native: null, hasRendererId: !!rendererId };
+  notificationEvents.set(id, record);
   unreadCount++;
+  notifLog('renderer event received id=' + id + (tag ? ' tag=' + tag : '') +
+    ', unread transition -> ' + unreadCount);
   updateUnreadIndicator('message received (unread=' + unreadCount + ')');
 
   const s = loadSettings();
   if (!s.notificationsEnabled) {
-    console.log('Notification suppressed (disabled by setting):', title, '| unread=', unreadCount);
+    notifLog('native suppressed by settings id=' + id);
     return;
   }
-
-  showNativeNotification(title, s.notificationPreview ? body : '');
-  console.log('Native notification shown:', title, '| unread=', unreadCount);
+  record.native = showNativeNotification(title, s.notificationPreview ? body : '', record);
+  pruneNotificationEvents();
 }
+
 
 // Only accept notifications from the WhatsApp Web window itself (the settings
 // window has a different preload and never sends on this channel).
@@ -825,19 +890,27 @@ function createWindow () {
   // M11: clearing unread here is also what clears the dock badge — the badge is
   // derived from the same counter, so "focus the app" and "badge disappears"
   // stay in lockstep with the tray tooltip.
-  mainWindow.on('focus', () => {
-    if (unreadCount > 0) {
-      unreadCount = 0;
-      updateUnreadIndicator('window focused');
-      console.log('Unread cleared (focus)');
+  function clearLegacyUnread(reason) {
+    let changed = false;
+    for (const record of notificationEvents.values()) {
+      if (!record.hasRendererId && !record.read) {
+        record.read = true;
+        changed = true;
+      }
     }
+    if (changed) {
+      unreadCount = 0;
+      updateUnreadIndicator(reason);
+      badgeLog('legacy unread cleared by', reason);
+    }
+  }
+  mainWindow.on('focus', () => {
+    // Do not infer read state for shim-generated events. WhatsApp's renderer
+    // lifecycle (close) or a notification click must clear those individually.
+    clearLegacyUnread('window focused');
   });
   mainWindow.on('show', () => {
-    if (unreadCount > 0) {
-      unreadCount = 0;
-      updateUnreadIndicator('window shown from tray');
-      console.log('Unread cleared (show from tray)');
-    }
+    clearLegacyUnread('window shown from tray');
   });
 }
 
@@ -991,6 +1064,8 @@ module.exports = {
   __activeNotifications: activeNotifications,
   __showNativeNotification: showNativeNotification,
   __dismissNotification: dismissNotification,
+  __notificationEvents: notificationEvents,
+  __markNotificationRead: markNotificationRead,
   // M11: dock/app-icon unread badge
   __desktopFileId: DESKTOP_FILE_ID,
   __badgeUpdates: BADGE_UPDATES,
