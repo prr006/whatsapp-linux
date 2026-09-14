@@ -366,23 +366,26 @@ test('notification: disabled banners preserve unread; focus clears it', () => {
   }
 });
 
-test('notification: auto-dismiss closes the banner but keeps unread', () => {
+test('notification: banner expires naturally but stays in history and keeps unread (M10)', () => {
   resetState();
+  const main = require(MAIN_JS);
   const timers = [];
   const realSetTimeout = global.setTimeout;
   global.setTimeout = (fn, ms) => { timers.push({ fn, ms }); return 1; };
   try {
-    fireNotification('Erin', 'auto dismiss me');
+    fireNotification('Erin', 'banner expiration test');
   } finally {
     global.setTimeout = realSetTimeout;
   }
   assert.strictEqual(electronMock.__notifications.length, 1);
-  assert.strictEqual(timers.length, 1, 'one auto-dismiss timer');
-  assert.strictEqual(timers[0].ms, 5000, 'bounded ~5s auto-dismiss');
-  timers[0].fn();
-  assert.ok(electronMock.__notifications[0].closeCount >= 1, 'banner closed by timer');
+  // M10: no auto-dismiss timer — GNOME handles banner timeout.
+  const closeTimers = timers.filter(t => t.ms === 5000);
+  assert.strictEqual(closeTimers.length, 0, 'M10: no 5s auto-dismiss timer (banner expires naturally)');
+  const n = electronMock.__notifications[0];
+  assert.strictEqual(n.closeCount, 0, 'banner expiration does NOT call close() — stays in history');
+  assert.ok(main.__activeNotifications.has(n), 'retained for history after banner expiration');
   assert.strictEqual(electronMock.__trayTooltip, 'WhatsApp — 1 unread',
-    'unread persists after the banner auto-dismisses');
+    'unread persists after banner expiration (still in history)');
 });
 
 test('notification: click restores and focuses the existing window, clearing unread', () => {
@@ -442,26 +445,30 @@ test('notification (bugfix): click still restores/focuses the same window and re
     'click releases the retained reference');
 });
 
-test('notification (bugfix): auto-dismiss timer closes the banner and releases the reference', () => {
+test('notification (bugfix): banner expiration keeps reference, close releases it (M10)', () => {
   resetState();
   const main = require(MAIN_JS);
   const timers = [];
   const realSetTimeout = global.setTimeout;
   global.setTimeout = (fn, ms) => { timers.push({ fn, ms }); return 1; };
   try {
-    fireNotification('Ivy', 'auto dismiss and release');
+    fireNotification('Ivy', 'banner expiration retains');
   } finally {
     global.setTimeout = realSetTimeout;
   }
   const n = electronMock.__notifications[0];
   assert.strictEqual(main.__activeNotifications.has(n), true,
-    'retained while the banner is still visible');
-  assert.strictEqual(timers.length, 1, 'one auto-dismiss timer');
-  assert.strictEqual(timers[0].ms, 5000, 'bounded ~5s auto-dismiss');
-  timers[0].fn();
-  assert.ok(n.closeCount >= 1, 'timer closed the banner');
+    'retained while banner visible and after expiration (in history)');
+  const closeTimers = timers.filter(t => t.ms === 5000);
+  assert.strictEqual(closeTimers.length, 0, 'M10: no auto-dismiss timer');
+  // Simulate GNOME banner expiration: banner hides but notification stays in center.
+  // No close() called, reference still held.
+  assert.strictEqual(n.closeCount, 0, 'banner expiration does NOT call close()');
+  assert.strictEqual(main.__activeNotifications.size, 1, 'still retained after banner expiration');
+  // Now user dismisses from center (daemon emits close) -> reference released.
+  n.__emit('close');
   assert.strictEqual(main.__activeNotifications.size, 0,
-    'timer releases the retained reference');
+    'daemon/user close releases the retained reference');
 });
 
 test('notification (bugfix): daemon/user close event releases the reference', () => {
@@ -475,12 +482,12 @@ test('notification (bugfix): daemon/user close event releases the reference', ()
     'close event releases the retained reference');
 });
 
-test('notification (bugfix): Linux options use timeoutType default (no per-notification ms timeout)', () => {
+test('notification (bugfix): Linux options use timeoutType default (GNOME handles timeout)', () => {
   resetState();
   fireNotification('Kai', 'timeout option check');
   const n = electronMock.__notifications[0];
   assert.strictEqual(n.opts.timeoutType, 'default',
-    'Electron Linux only supports default/never; the ~5s window is enforced via close()');
+    'Electron Linux only supports default/never; GNOME handles ~5s banner timeout, notification stays in history');
 });
 
 // ---- M9 root-cause regression: real delivery path ---------------------------

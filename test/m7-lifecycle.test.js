@@ -188,12 +188,15 @@ test('notification: suppressed when the app is already focused', () => {
   assert.strictEqual(electronMock.__notifications.length, before, 'no banner while focused');
 });
 
-test('notification: shown when hidden; click restores + focuses the SAME window', () => {
+test('notification: shown when hidden; click restores + focuses the SAME window (M10 GNOME persistence)', () => {
   win.__visible = false;
   win.__focused = false;
   electronMock.__notifications.length = 0;
+  const main = require(path.join(__dirname, '..', 'src', 'main.js'));
+  main.__activeNotifications.clear();
 
-  // Capture the auto-dismiss timer instead of waiting 5s.
+  // Capture any timers — M10 must NOT schedule an auto-dismiss timer that
+  // would call close() and remove the notification from GNOME history.
   const timers = [];
   const realSetTimeout = global.setTimeout;
   global.setTimeout = (fn, ms) => { timers.push({ fn, ms }); return 1; };
@@ -206,22 +209,26 @@ test('notification: shown when hidden; click restores + focuses the SAME window'
   assert.strictEqual(electronMock.__notifications.length, 1);
   const n = electronMock.__notifications[0];
   assert.strictEqual(n.shown, true, 'notification shown');
-  assert.strictEqual(timers.length, 1, 'one auto-dismiss timer scheduled');
-  assert.strictEqual(timers[0].ms, 5000, 'auto-dismiss at the ~5s default');
+  // M10: no auto-dismiss timer — banner expires via GNOME's own timeout.
+  const closeTimers = timers.filter(t => t.ms === 5000);
+  assert.strictEqual(closeTimers.length, 0, 'M10: no 5s auto-dismiss timer (banner expires naturally)');
   assert.strictEqual(electronMock.__trayTooltip, 'WhatsApp — 1 unread', 'unread bumped while hidden');
 
-  // Auto-dismiss fires -> close() is called (notification no longer visible).
-  timers[0].fn();
-  assert.ok(n.closeCount >= 1, 'auto-dismiss calls close()');
+  // Banner expiration (GNOME hides pop-out after ~5s) must NOT call close().
+  // close() is CloseNotification and would remove from history — we want it
+  // to stay in history until user acts.
+  assert.strictEqual(n.closeCount, 0, 'banner expiration does NOT call close() — stays in history');
+  assert.ok(main.__activeNotifications.has(n), 'notification retained for history (strong ref)');
 
-  // Click -> dismiss again (idempotent) + restore/focus the existing window.
+  // Click -> dismiss (removes from history) + restore/focus the existing window.
   const windowsBefore = electronMock.__windows.length;
   n.__click();
-  assert.ok(n.closeCount >= 2, 'click calls close()');
+  assert.ok(n.closeCount >= 1, 'click calls close() to remove from history');
   assert.strictEqual(win.__visible, true, 'window restored');
   assert.strictEqual(win.__focused, true, 'window focused');
   assert.strictEqual(electronMock.__windows.length, windowsBefore, 'no new window created');
   assert.strictEqual(electronMock.__trayTooltip, 'WhatsApp for Linux', 'unread cleared on restore');
+  assert.strictEqual(main.__activeNotifications.size, 0, 'click releases retained reference');
 });
 
 test('notification: duplicate within the dedup window is suppressed', () => {
