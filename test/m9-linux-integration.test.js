@@ -98,7 +98,8 @@ class MockNotification {
   on(ev, cb) { (this.__handlers[ev] = this.__handlers[ev] || []).push(cb); }
   show() { this.shown = true; }
   close() { this.closeCount++; }
-  __click() { (this.__handlers['click'] || []).forEach((cb) => cb()); }
+  __emit(ev, ...args) { (this.__handlers[ev] || []).forEach((cb) => cb(...args)); }
+  __click() { this.__emit('click'); }
 }
 
 class MockTray {
@@ -179,9 +180,11 @@ function fireNotification(title, body) {
 }
 
 // Reset the shared notification state (banner list, window hidden/unfocused,
-// any leftover unread) so each test starts from a clean slate.
+// any leftover unread, and the M9-bugfix active-notification references) so
+// each test starts from a clean slate.
 function resetState() {
   electronMock.__notifications.length = 0;
+  require(MAIN_JS).__activeNotifications.clear();
   win.__visible = false;
   win.__focused = false;
   win.__emit('focus'); // focus handler clears unread if it was > 0
@@ -397,4 +400,80 @@ test('notification: tray reopen (show) clears unread state', () => {
   assert.strictEqual(electronMock.__trayTooltip, 'WhatsApp — 1 unread');
   win.show(); // mock emits 'show', matching the tray "Show WhatsApp" path
   assert.strictEqual(electronMock.__trayTooltip, 'WhatsApp for Linux', 'unread cleared on show');
+});
+
+// ---- 5. M9 bugfix: Linux notification click + dismissal --------------------
+
+// The mocked tests previously only verified that a click handler was attached
+// and would fire when invoked manually — they never proved the Notification
+// object stays alive long enough for Electron (libnotify) to deliver the real
+// click. Electron's Notification wrapper holds only a WeakPtr to the native
+// notification; once the JS object is collected, Electron clears the native
+// delegate and `click` stops reaching JS. These tests pin the retention fix.
+
+test('notification (bugfix): live notification is retained against GC until dismissed', () => {
+  resetState();
+  const main = require(MAIN_JS);
+  fireNotification('Hank', 'retain me');
+  assert.strictEqual(main.__activeNotifications.size, 1,
+    'exactly one live notification is retained');
+  const n = electronMock.__notifications[0];
+  assert.strictEqual(main.__activeNotifications.has(n), true,
+    'the retained object is the shown notification');
+});
+
+test('notification (bugfix): click still restores/focuses the same window and releases the reference', () => {
+  resetState();
+  const main = require(MAIN_JS);
+  fireNotification('Frank', 'click me after being retained');
+  const n = electronMock.__notifications[0];
+  const windowsBefore = electronMock.__windows.length;
+  n.__click();
+  assert.ok(n.closeCount >= 1, 'click dismisses the banner');
+  assert.strictEqual(win.__visible, true, 'window restored');
+  assert.strictEqual(win.__focused, true, 'window focused');
+  assert.strictEqual(electronMock.__windows.length, windowsBefore, 'no new window created');
+  assert.strictEqual(main.__activeNotifications.size, 0,
+    'click releases the retained reference');
+});
+
+test('notification (bugfix): auto-dismiss timer closes the banner and releases the reference', () => {
+  resetState();
+  const main = require(MAIN_JS);
+  const timers = [];
+  const realSetTimeout = global.setTimeout;
+  global.setTimeout = (fn, ms) => { timers.push({ fn, ms }); return 1; };
+  try {
+    fireNotification('Ivy', 'auto dismiss and release');
+  } finally {
+    global.setTimeout = realSetTimeout;
+  }
+  const n = electronMock.__notifications[0];
+  assert.strictEqual(main.__activeNotifications.has(n), true,
+    'retained while the banner is still visible');
+  assert.strictEqual(timers.length, 1, 'one auto-dismiss timer');
+  assert.strictEqual(timers[0].ms, 5000, 'bounded ~5s auto-dismiss');
+  timers[0].fn();
+  assert.ok(n.closeCount >= 1, 'timer closed the banner');
+  assert.strictEqual(main.__activeNotifications.size, 0,
+    'timer releases the retained reference');
+});
+
+test('notification (bugfix): daemon/user close event releases the reference', () => {
+  resetState();
+  const main = require(MAIN_JS);
+  fireNotification('Jack', 'the daemon dismisses me');
+  const n = electronMock.__notifications[0];
+  assert.strictEqual(main.__activeNotifications.has(n), true);
+  n.__emit('close'); // daemon/user dismissed it (Electron emits 'close' on libnotify close)
+  assert.strictEqual(main.__activeNotifications.size, 0,
+    'close event releases the retained reference');
+});
+
+test('notification (bugfix): Linux options use timeoutType default (no per-notification ms timeout)', () => {
+  resetState();
+  fireNotification('Kai', 'timeout option check');
+  const n = electronMock.__notifications[0];
+  assert.strictEqual(n.opts.timeoutType, 'default',
+    'Electron Linux only supports default/never; the ~5s window is enforced via close()');
 });
