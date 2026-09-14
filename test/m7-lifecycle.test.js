@@ -30,7 +30,7 @@ const electronMock = {
   __menuTemplate: null,
   __tray: null,
   __trayTooltip: null,
-  __notificationHandler: null,
+  __ipcListeners: {},
 };
 
 class MockBrowserWindow {
@@ -46,7 +46,6 @@ class MockBrowserWindow {
       __handlers: {},
       on: (ev, cb) => {
         wc.__handlers[ev] = (wc.__handlers[ev] || []).concat([cb]);
-        if (ev === 'notification') electronMock.__notificationHandler = cb;
       },
       __emit: (ev, ...args) => {
         (wc.__handlers[ev] || []).slice().forEach((cb) => cb(...args));
@@ -125,7 +124,10 @@ electronMock.BrowserWindow = MockBrowserWindow;
 electronMock.Tray = MockTray;
 electronMock.Menu = { buildFromTemplate(t) { return t; } };
 electronMock.Notification = MockNotification;
-electronMock.ipcMain = { handle() {} };
+electronMock.ipcMain = {
+  handle() {},
+  on(channel, fn) { electronMock.__ipcListeners[channel] = fn; },
+};
 electronMock.nativeImage = {
   createFromPath: () => ({ isEmpty: () => false }),
   createFromBuffer: () => ({ isEmpty: () => false }),
@@ -147,7 +149,10 @@ before(async () => {
   await new Promise((r) => setImmediate(r));
   win = electronMock.__mainWindow;
   assert.ok(win, 'main window created');
-  assert.ok(electronMock.__notificationHandler, 'notification handler registered');
+  assert.ok(electronMock.__ipcListeners['wa-web-notification'],
+    'wa-web-notification IPC listener registered (real Electron entry point)');
+  assert.ok(win.opts.webPreferences && /preload\.js$/.test(win.opts.webPreferences.preload),
+    'main window loads src/preload.js (installs the Notification shim)');
 });
 
 after(() => {
@@ -155,13 +160,15 @@ after(() => {
   try { fs.rmSync(userDataDir, { recursive: true, force: true }); } catch {}
 });
 
-function fireNotification(title, body) {
-  let prevented = false;
-  electronMock.__notificationHandler(
-    { preventDefault: () => { prevented = true; } },
-    { title, body }
+// Drive the REAL entry point: the 'wa-web-notification' IPC message that
+// src/preload.js sends from its main-world `window.Notification` shim.
+// (Electron's webContents has no 'notification' event — the old harness
+// fabricated one and masked the bug.)
+function fireNotification(title, body, sender) {
+  electronMock.__ipcListeners['wa-web-notification'](
+    { sender: sender || win.webContents },
+    { title, body, tag: '' }
   );
-  assert.ok(prevented, 'web notification default must be prevented');
 }
 
 test('close-to-tray: X hides the window instead of closing it', () => {
