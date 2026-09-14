@@ -45,11 +45,18 @@ contextBridge.exposeInMainWorld('whatsappLinux', {
 // world, so it calls this isolated-world function via the bridge.
 contextBridge.exposeInMainWorld('__whatsappLinuxNotify', (payload) => {
   try {
-    ipcRenderer.send(NOTIFY_CHANNEL, {
+    const event = {
       title: payload && typeof payload.title === 'string' ? payload.title : '',
       body: payload && typeof payload.body === 'string' ? payload.body : '',
       tag: payload && typeof payload.tag === 'string' ? payload.tag : ''
+    };
+    // Keep the historical enumerable payload stable for WhatsApp and existing
+    // integrations; lifecycle metadata remains available to the main process.
+    Object.defineProperties(event, {
+      eventId: { value: payload && typeof payload.eventId === 'string' ? payload.eventId : '', enumerable: false },
+      lifecycle: { value: payload && typeof payload.lifecycle === 'string' ? payload.lifecycle : 'constructor', enumerable: false }
     });
+    ipcRenderer.send(NOTIFY_CHANNEL, event);
   } catch (e) {
     // Never let a bridge failure surface into the page.
   }
@@ -60,6 +67,10 @@ contextBridge.exposeInMainWorld('__whatsappLinuxNotify', (payload) => {
 // that WhatsApp Web sees. It is installed before any page script executes
 // because preload runs prior to the document's own scripts.
 const SHIM = `(() => {
+  // A constructor is an event, not a message identity. This renderer-local
+  // sequence lets the main process suppress an IPC retry of the same
+  // constructor without coalescing later constructors with identical text.
+  let rendererNotificationSequence = 0;
   const NativeNotification = window.Notification;
   if (!NativeNotification || NativeNotification.__whatsappLinuxShim) return;
 
@@ -81,9 +92,17 @@ const SHIM = `(() => {
     this.onerror = null;
     this.onshow = null;
     this._listeners = Object.create(null);
+    this._eventId = 'renderer-' + (++rendererNotificationSequence);
 
     if (typeof forward === 'function') {
-      try { forward({ title: this.title, body: this.body, tag: this.tag }); } catch (e) {}
+      try {
+        const event = { title: this.title, body: this.body, tag: this.tag };
+        Object.defineProperties(event, {
+          eventId: { value: this._eventId, enumerable: false },
+          lifecycle: { value: 'constructor', enumerable: false }
+        });
+        forward(event);
+      } catch (e) {}
     }
 
     // Emulate the spec'd async "show" so callers waiting on it don't hang.
@@ -97,6 +116,18 @@ const SHIM = `(() => {
   ShimNotification.prototype.close = function () {
     if (this._closed) return;
     this._closed = true;
+    if (typeof forward === 'function') {
+      try {
+        const event = { title: this.title, body: this.body, tag: this.tag };
+        Object.defineProperties(event, {
+          eventId: { value: this._eventId, enumerable: false },
+          lifecycle: { value: 'close', enumerable: false }
+        });
+        // Queue recall after the constructor turn, matching the browser's
+        // asynchronous event delivery and avoiding re-entrancy in page code.
+        Promise.resolve().then(() => forward(event));
+      } catch (e) {}
+    }
     if (typeof this.onclose === 'function') { try { this.onclose(new Event('close')); } catch (e) {} }
     this._dispatch('close');
   };
