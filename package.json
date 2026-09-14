@@ -8,6 +8,7 @@
     "email": "team@prr006.whatsapp-linux"
   },
   "license": "MIT",
+  "desktopName": "whatsapp-linux",
   "keywords": [
     "whatsapp",
     "linux",
@@ -19,8 +20,9 @@
     "start": "electron .",
     "dist": "electron-builder",
     "pack": "electron-builder --dir",
-    "test": "node --test test/m7-lifecycle.test.js",
+    "test": "node --test test/*.test.js",
     "measure:startup": "bash scripts/measure-startup.sh",
+    "measure:resources": "bash scripts/measure-resources.sh",
     "test:build": "echo 'Build verification only — run manually with display server'"
   },
   "build": {
@@ -37,7 +39,8 @@
         "AppImage",
         "deb"
       ],
-      "icon": "build/icons/icon.png"
+      "icon": "build/icons/icon.png",
+      "syncDesktopName": true
     },
     "files": [
       "src/**/*",

@@ -5,81 +5,278 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>WhatsApp for Linux — Settings</title>
 <style>
+  :root {
+    /* Adwaita-inspired neutral palette (dark) */
+    --bg: #242424;
+    --bg-header: #1d1d1d;
+    --surface: #2d2d2d;
+    --surface-hover: #353535;
+    --border: #3d3d3d;
+    --text: #f2f2f2;
+    --text-dim: #9a9a9a;
+    --accent: #3584e4;
+    --accent-hover: #4a94ef;
+    --accent-text: #ffffff;
+    --switch-off: #555555;
+    --success: #2ec27e;
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #f6f5f4;
+      --bg-header: #fafafa;
+      --surface: #ffffff;
+      --surface-hover: #f1f1f1;
+      --border: #deddda;
+      --text: #2e3436;
+      --text-dim: #7a7a7a;
+      --accent: #3584e4;
+      --accent-hover: #2f76c9;
+      --accent-text: #ffffff;
+      --switch-off: #b5b5b5;
+      --success: #26a269;
+    }
+  }
+
   * { box-sizing: border-box; }
+  html, body { height: 100%; }
   body {
-    background: #111b21;
-    color: #e9edef;
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-    margin: 0; padding: 28px;
-    font-size: 15px;
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Cantarell",
+      "Ubuntu", "Noto Sans", Helvetica, Arial, sans-serif;
+    font-size: 14px;
+    line-height: 1.4;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
   }
-  h1 {
-    color: #25D366;
-    font-size: 22px;
-    margin: 0 0 24px 0;
-    letter-spacing: -0.5px;
+
+  /* Header bar (looks like a client-side decoration title) */
+  .header {
+    flex: 0 0 auto;
+    background: var(--bg-header);
+    border-bottom: 1px solid var(--border);
+    padding: 16px 20px;
   }
+  .header .app {
+    font-size: 12px;
+    color: var(--text-dim);
+    letter-spacing: 0.02em;
+  }
+  .header h1 {
+    margin: 2px 0 0;
+    font-size: 20px;
+    font-weight: 700;
+    letter-spacing: -0.2px;
+  }
+
+  /* Scrollable body */
+  .content {
+    flex: 1 1 auto;
+    overflow-y: auto;
+    padding: 4px 20px 12px;
+  }
+
+  .section { margin: 18px 0 6px; }
+  .section-title {
+    font-size: 11px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--text-dim);
+    margin: 0 0 4px;
+  }
+
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    overflow: hidden;
+  }
+
+  /* A settings row: label + description on the left, switch on the right */
   .row {
-    display: flex; align-items: center; justify-content: space-between;
-    padding: 14px 0; border-bottom: 1px solid #2a3942;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    padding: 13px 16px;
   }
-  label { font-weight: 500; }
-  input[type="checkbox"] {
-    width: 20px; height: 20px;
-    accent-color: #25D366; cursor: pointer;
+  .row + .row { border-top: 1px solid var(--border); }
+  .row:hover { background: var(--surface-hover); }
+
+  .row .meta { min-width: 0; }
+  .row .label {
+    font-weight: 600;
+    display: block;
   }
-  .buttons {
-    margin-top: 28px; display: flex; gap: 10px;
+  .row .desc {
+    display: block;
+    margin-top: 2px;
+    font-size: 12px;
+    color: var(--text-dim);
+  }
+
+  /* Toggle switch */
+  .switch { position: relative; display: inline-block; flex: 0 0 auto; }
+  .switch input {
+    position: absolute;
+    opacity: 0;
+    width: 0;
+    height: 0;
+  }
+  .switch .track {
+    display: block;
+    width: 40px;
+    height: 24px;
+    border-radius: 999px;
+    background: var(--switch-off);
+    transition: background 0.15s ease;
+    position: relative;
+    cursor: pointer;
+  }
+  .switch .track::after {
+    content: "";
+    position: absolute;
+    top: 3px;
+    left: 3px;
+    width: 18px;
+    height: 18px;
+    border-radius: 50%;
+    background: #ffffff;
+    box-shadow: 0 1px 2px rgba(0,0,0,0.3);
+    transition: transform 0.15s ease;
+  }
+  .switch input:checked + .track { background: var(--accent); }
+  .switch input:checked + .track::after { transform: translateX(16px); }
+  .switch input:focus-visible + .track {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+  .switch input:disabled + .track { opacity: 0.45; cursor: not-allowed; }
+
+  /* Footer buttons */
+  .footer {
+    flex: 0 0 auto;
+    display: flex;
+    gap: 10px;
+    justify-content: flex-end;
+    padding: 14px 20px 16px;
+    border-top: 1px solid var(--border);
+    background: var(--bg-header);
   }
   button {
-    background: #25D366; color: #fff; border: none;
-    padding: 10px 20px; font-size: 14px; font-weight: 600;
-    border-radius: 6px; cursor: pointer; transition: background 0.15s;
+    font: inherit;
+    font-weight: 600;
+    padding: 9px 18px;
+    border-radius: 8px;
+    cursor: pointer;
+    border: 1px solid transparent;
+    transition: background 0.12s ease, border-color 0.12s ease;
   }
-  button:hover { background: #1ebe57; }
+  button.primary {
+    background: var(--accent);
+    color: var(--accent-text);
+  }
+  button.primary:hover { background: var(--accent-hover); }
   button.secondary {
-    background: transparent; color: #e9edef; border: 1px solid #8696a0;
+    background: transparent;
+    color: var(--text);
+    border-color: var(--border);
   }
-  button.secondary:hover { background: #2a3942; }
+  button.secondary:hover { background: var(--surface-hover); }
+
   .note {
-    color: #8696a0; font-size: 12px; margin-top: 16px;
+    padding: 0 20px 14px;
+    font-size: 12px;
+    color: var(--text-dim);
   }
 </style>
 </head>
 <body>
-<h1>Settings</h1>
 
-<div class="row">
-  <label for="closeToTray">Close to tray</label>
-  <input type="checkbox" id="closeToTray">
+<div class="header">
+  <div class="app">WhatsApp for Linux</div>
+  <h1>Settings</h1>
 </div>
 
-<div class="row">
-  <label for="startWithSystem">Start with system (stored)</label>
-  <input type="checkbox" id="startWithSystem">
+<div class="content">
+  <div class="section">
+    <p class="section-title">Startup</p>
+    <div class="card">
+      <div class="row">
+        <span class="meta">
+          <span class="label" id="startWithSystemLabel">Start with system</span>
+          <span class="desc">Launch WhatsApp when you log in</span>
+        </span>
+        <label class="switch">
+          <input type="checkbox" id="startWithSystem">
+          <span class="track"></span>
+        </label>
+      </div>
+      <div class="row">
+        <span class="meta">
+          <span class="label">Start minimized</span>
+          <span class="desc">Start hidden in the system tray</span>
+        </span>
+        <label class="switch">
+          <input type="checkbox" id="startMinimized">
+          <span class="track"></span>
+        </label>
+      </div>
+    </div>
+  </div>
+
+  <div class="section">
+    <p class="section-title">Window</p>
+    <div class="card">
+      <div class="row">
+        <span class="meta">
+          <span class="label">Close to tray</span>
+          <span class="desc">Keep running in the tray when the window is closed</span>
+        </span>
+        <label class="switch">
+          <input type="checkbox" id="closeToTray">
+          <span class="track"></span>
+        </label>
+      </div>
+    </div>
+  </div>
+
+  <div class="section">
+    <p class="section-title">Notifications</p>
+    <div class="card">
+      <div class="row">
+        <span class="meta">
+          <span class="label">Desktop notifications</span>
+          <span class="desc">Show native notifications for new messages</span>
+        </span>
+        <label class="switch">
+          <input type="checkbox" id="notificationsEnabled">
+          <span class="track"></span>
+        </label>
+      </div>
+      <div class="row">
+        <span class="meta">
+          <span class="label">Notification preview</span>
+          <span class="desc">Include the message text in notifications</span>
+        </span>
+        <label class="switch">
+          <input type="checkbox" id="notificationPreview">
+          <span class="track"></span>
+        </label>
+      </div>
+    </div>
+  </div>
 </div>
 
-<div class="row">
-  <label for="startMinimized">Start minimized (stored)</label>
-  <input type="checkbox" id="startMinimized">
-</div>
+<div class="note">Changes take effect immediately. Your WhatsApp session is not affected.</div>
 
-<div class="row">
-  <label for="notificationsEnabled">Desktop notifications</label>
-  <input type="checkbox" id="notificationsEnabled">
-</div>
-
-<div class="row">
-  <label for="notificationPreview">Notification preview</label>
-  <input type="checkbox" id="notificationPreview">
-</div>
-
-<div class="buttons">
-  <button onclick="save()">Save</button>
+<div class="footer">
   <button class="secondary" onclick="closeWindow()">Close</button>
+  <button class="primary" onclick="save()">Save</button>
 </div>
-
-<div class="note">Changes take effect immediately. WhatsApp session is not affected.</div>
 
 <script>
   async function load() {
@@ -90,10 +287,19 @@
       document.getElementById('startMinimized').checked = s.startMinimized === true;
       document.getElementById('notificationsEnabled').checked = s.notificationsEnabled !== false;
       document.getElementById('notificationPreview').checked = s.notificationPreview !== false;
+      syncPreviewState();
     } catch (e) {
       console.error('Failed to load settings:', e);
     }
   }
+
+  // Preview toggle is only meaningful when notifications are enabled.
+  function syncPreviewState() {
+    const enabled = document.getElementById('notificationsEnabled').checked;
+    document.getElementById('notificationPreview').disabled = !enabled;
+  }
+  document.getElementById('notificationsEnabled').addEventListener('change', syncPreviewState);
+
   async function save() {
     try {
       await window.whatsappLinuxSettings.setSettings({
@@ -108,9 +314,11 @@
       console.error('Failed to save settings:', e);
     }
   }
+
   function closeWindow() {
     window.close();
   }
+
   load();
 </script>
 </body>
