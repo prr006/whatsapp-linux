@@ -2,7 +2,7 @@
 
 A polished, lightweight Linux desktop client around the official WhatsApp Web experience.
 
-> **Status:** M8 (current) — startup profiling / cold-start measurement, building on the merged M7 (startup + notification UX). Verified on a real machine: packaged app takes roughly **4–5 s until WhatsApp is usable**, while the tray appears in roughly **1–2 s**.
+> **Status:** M9 (current) — Linux desktop integration, settings correctness, notification polish, and release polish, building on M8 (startup profiling) and M7 (startup + notification UX). Verified on a real machine: packaged app takes roughly **4–5 s until WhatsApp is usable**, while the tray appears in roughly **1–2 s**.
 
 ## Project Goals (from specification)
 - WhatsApp Web login via QR
@@ -28,7 +28,8 @@ A polished, lightweight Linux desktop client around the official WhatsApp Web ex
 - M3: Full tray/menu integration, close-to-tray, start minimized, packaging.
 - M4 (optional): Voice/video calls, app lock, updater.
 - M7 (merged): Startup + notification UX polish — see below.
-- **M8 (current): Startup profiling / cold-start measurement** — see below.
+- M8 (merged): Startup profiling / cold-start measurement — see below.
+- **M9 (current): Linux integration, settings, notifications & release polish** — see below.
 
 ## M7 — Startup & Notification UX
 - **Notifications** (see `webContents.on('notification')` in `src/main.js`):
@@ -50,10 +51,10 @@ A polished, lightweight Linux desktop client around the official WhatsApp Web ex
     `ready-to-show` → `did-finish-load` → `tray created`, and log tray-resume
     restores, so cold-start and resume cost can be measured on a real machine.
     M8 completes this to a full 9-point instrumented timeline (below).
-- **Tests**: `npm test` runs `test/m7-lifecycle.test.js` (mocked Electron,
-  no display needed) covering close-to-tray, focused/hidden notification
+- **Tests**: `npm test` runs every `test/*.test.js` with a mocked Electron (no
+  display needed) covering close-to-tray, focused/hidden notification
   behaviour, auto-dismiss, click-to-restore, dedup, disabled toggle,
-  single-instance, and quit-cascade.
+  single-instance, quit-cascade, and the M8 instrumentation timeline.
 
 ## M8 — Startup Profiling / Cold-Start Measurement
 
@@ -137,22 +138,106 @@ Notes:
 Next step (after collecting runs with the harness): identify the dominant
 cost stage(s) and evaluate optimisations against the **< 3 s** goal.
 
+## M9 — Linux Integration, Settings, Notifications & Release Polish
+
+### 1. Linux desktop identity / association
+- `desktopName: "whatsapp-linux"` is set in `package.json` (root) and
+  `linux.syncDesktopName: true` in the build config. This removes the
+  electron-builder *"desktopName is not set in package.json"* warning and makes
+  the installed `.desktop` filename (`whatsapp-linux.desktop`),
+  `StartupWMClass`, and Electron's runtime `app_id`/`WM_CLASS` all agree, so
+  GNOME/KDE associate the running window with the correct launcher entry (no
+  duplicate/generic dock entry, correct taskbar icon).
+- Verified generated entry (electron-builder v26, `syncDesktopName: true`):
+  ```
+  [Desktop Entry]
+  Name=WhatsApp for Linux
+  Exec=/opt/WhatsApp for Linux/whatsapp-linux
+  Terminal=false
+  Type=Application
+  Icon=whatsapp-linux
+  StartupWMClass=whatsapp-linux
+  Categories=Network;
+  ```
+- Clicking the launcher while the app is hidden to tray still restores the
+  existing window: a re-launch hits the single-instance lock and routes through
+  `showAndFocusMainWindow()`, and the corrected `WM_CLASS` lets the desktop
+  environment activate the existing window directly.
+
+### 2. Start with system / Start minimized
+- **Start minimized** (already honoured at startup) now has explicit tests and a
+  `--start-minimized` / `--hidden` CLI flag (used by the autostart path and the
+  resource harness). The window is created off-screen and stays hidden in the
+  tray; the WhatsApp Web instance is never reloaded.
+- **Start with system** is now genuinely functional via the proper XDG
+  autostart mechanism: enabling the setting writes
+  `~/.config/autostart/whatsapp-linux.desktop` (pointing at the AppImage file
+  when run as an AppImage, the installed executable when packaged, or the dev
+  Electron binary + app dir); disabling it removes the file. No cron/hack.
+- Close-to-tray, tray notifications, and single-instance behaviour are
+  unchanged.
+
+### 3. Notification edge-case polish (M7 audit)
+No design changes were needed — M7 already suppressed banners while focused,
+deduplicated, auto-dismissed, and restored the window on click. M9 locks the
+edge cases down with tests: focused app → no banner **and** no unread bump;
+hidden app → native banner; duplicates → fully suppressed (banner + unread);
+auto-dismiss → banner closed but unread kept; click → same window restored and
+unread cleared; multiple messages → one banner/unread each; notifications
+disabled → no banner but unread still tracked; tray reopen → unread cleared.
+No separate background notification daemon.
+
+### 4. Settings UI polish
+`src/settings.html` was restyled as a native-feeling desktop settings page
+(sectioned cards, switch toggles, Adwaita-inspired dark/light palettes via
+`prefers-color-scheme`). Pure CSS — no UI framework. All five settings and the
+save/close behaviour are unchanged.
+
+### 5. Packaging / release audit
+- DEB and AppImage builds are unchanged and still configured (`npm run dist`).
+- The installed `.desktop` entry and icons are generated from `desktopName` +
+  `build/icons` as above.
+- Persistent login/session and settings live in `~/.config/whatsapp-linux`
+  (unchanged `persist:whatsapp-linux` partition + `settings.json`), so they
+  survive reinstall/upgrade of the package (package removal does not touch
+  per-user data — intentional, like most desktop apps).
+- The autostart entry is per-user and managed by the setting; after uninstall
+  it simply becomes inert (its `Exec` target is gone).
+
+### 6. Resource baseline (measurement only — no optimisation)
+`scripts/measure-resources.sh` (run via `npm run measure:resources`) samples the
+**whole Electron process tree** via `/proc` and reports idle RAM, idle CPU, and
+the tray-hidden idle state (launched with `--start-minimized`):
+
+```bash
+npm run measure:resources -- --dev                    # idle after startup (window visible)
+npm run measure:resources -- --dev --start-minimized  # tray-hidden idle state
+npm run measure:resources -- --app "/path/to/WhatsApp for Linux.AppImage"
+# options: --settle S, --sample S, --timeout S, --user-data DIR, --kill
+```
+
+This requires a real Linux desktop session (display + Electron binary), which is
+not available in the Arena sandbox — see Known Issues. **Report the numbers
+before optimising anything.**
+
 ## Directory Structure
 ```
 whatsapp-linux/
 ├── src/
-│   ├── main.js         # Electron main (window, tray, session, events, M8 [perf] instrumentation)
+│   ├── main.js         # Electron main (window, tray, session, settings/autostart, events, [perf] instrumentation)
 │   ├── preload.js      # Safe bridge (empty in M1 per principles)
 │   ├── preload-settings.js
-│   └── settings.html
+│   └── settings.html   # Native-feeling settings page (M9)
 ├── scripts/
-│   └── measure-startup.sh  # M8 cold-start measurement harness (npm run measure:startup)
+│   ├── measure-startup.sh    # M8 cold-start measurement harness
+│   └── measure-resources.sh  # M9 idle RAM/CPU baseline (measurement only)
 ├── test/
-│   └── m7-lifecycle.test.js # Mocked-Electron tests, incl. M8 instrumentation tests
+│   ├── m7-lifecycle.test.js        # Mocked-Electron lifecycle/notification tests
+│   └── m9-linux-integration.test.js# M9 desktop identity, autostart, start-minimized, notification edge cases
 ├── build/
 │   ├── icons/icon.png  # App icon (AI-generated)
 │   └── whatsapp-linux.desktop
-├── package.json        # Dependencies, build config, scripts
+├── package.json        # Dependencies, build config (desktopName, syncDesktopName), scripts
 ├── .gitignore
 └── README.md
 ```
@@ -165,18 +250,22 @@ npm start
 
 ## Build
 ```bash
-npm run dist   # AppImage / deb / rpm
+npm run dist   # AppImage / deb (electron-builder)
+```
+
+## Test
+```bash
+npm test       # node --test test/*.test.js — 24 tests, mocked Electron, no display needed
 ```
 
 ## Testing Protocol (per instructions)
 After M1 build: initial launch → QR display → login → send message → receive message → close → reopen → session persistence → inspect logs → verify no Chromium errors.
 
-## Known Issues / Limitations (M1)
-- **Electron binary download blocked** in this sandbox (`curl`/`node fetch` fail to `github.com/electron` releases with SSL errors). Build verified via `npm install` (285 packages), `node --check`, and dry-run test. Actual launch requires downloading `electron-v44.3.0-linux-x64.zip` (~180 MB) or using an environment with unrestricted download.
-- **No display server** (Xvfb) installed; launch would require `DISPLAY=:99` or a real X11/Wayland session.
+## Known Issues / Limitations
+- **Electron binary download blocked** in this sandbox (`curl`/`node fetch` fail to `github.com/electron` releases with SSL errors). `npm install` succeeds (285 packages), `node --check`, `npm test`, and the build-config audit all pass, but `npm run dist` stops at the electron binary download step ("unable to verify the first certificate") and actual launch requires downloading `electron-v44.3.0-linux-x64.zip` (~180 MB) or an environment with unrestricted download.
+- **No display server** (Xvfb) installed; launch would require `DISPLAY=:99` or a real X11/Wayland session. This also means the M9 resource baseline (`npm run measure:resources`) and any dock/taskbar/WM_CLASS observation must run on a real desktop — the script is provided and measurement-only.
 - **No system browsers** installed for independent WhatsApp Web verification (not required since Electron bundles Chromium).
-- **Tray functionality untested** at runtime; code uses standard Electron `Tray` and `Menu` APIs.
-- **Notifications / unread badges / close-to-tray / start-with-system** deferred to M2/M3 per milestone plan.
+- **Tray/dock behaviour untested at runtime** in this sandbox; code uses standard Electron `Tray`, `Menu`, single-instance and XDG autostart APIs, verified by mocked tests and the build-config audit.
 - **WebRTC calls** expected to work (Electron = Chromium) but not explicitly tested yet.
 
 ## Principles Followed

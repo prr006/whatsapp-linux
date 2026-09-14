@@ -25,6 +25,13 @@ function perfLog(label) {
 }
 perfLog('main process started');
 
+// M9: --start-minimized / --hidden CLI flag — start the window hidden to the
+// tray. Used by the XDG autostart path (a login launch is non-intrusive) and
+// by the resource-measurement harness to sample the tray-hidden idle state
+// without a manual click.
+const START_HIDDEN_OVERRIDE =
+  process.argv.includes('--start-minimized') || process.argv.includes('--hidden');
+
 /**
  * Resolve a runtime icon that native APIs (Tray, Notification) can load.
  *
@@ -118,6 +125,60 @@ function saveSettings(s) {
   } catch (e) {
     console.error('Failed to save settings:', e);
   }
+}
+
+// M9: XDG autostart ("Start with system"). A proper Linux desktop mechanism —
+// a .desktop entry in ~/.config/autostart — rather than a cron/hack. The entry
+// is written/removed when the setting changes, so the toggle is immediately
+// effective and survives logout/login.
+function getAutostartDesktopPath() {
+  return path.join(app.getPath('appData'), 'autostart', 'whatsapp-linux.desktop');
+}
+
+function getAutostartExec() {
+  // AppImage: point at the AppImage file itself (APPIMAGE env var is set by the
+  // AppImage runtime and survives relocation better than a mutable mount path).
+  if (process.env.APPIMAGE) {
+    return '"' + process.env.APPIMAGE + '"';
+  }
+  // Packaged (deb): the real installed executable path.
+  if (app.isPackaged) {
+    return '"' + process.execPath + '"';
+  }
+  // Dev: the Electron binary plus the app directory.
+  return '"' + process.execPath + '" "' + app.getAppPath() + '"';
+}
+
+function setStartWithSystem(enabled) {
+  const file = getAutostartDesktopPath();
+  try {
+    if (enabled) {
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      const lines = [
+        '[Desktop Entry]',
+        'Type=Application',
+        'Version=1.0',
+        'Name=WhatsApp for Linux',
+        'Comment=Start WhatsApp for Linux when you log in',
+        'Exec=' + getAutostartExec(),
+        'Terminal=false',
+        'X-GNOME-Autostart-enabled=true'
+      ];
+      fs.writeFileSync(file, lines.join('\n') + '\n');
+    } else {
+      fs.rmSync(file, { force: true });
+    }
+    return true;
+  } catch (err) {
+    console.error('Failed to update autostart entry:', err);
+    return false;
+  }
+}
+
+// M9: whether the window should start hidden (tray only). Honors the persisted
+// startMinimized setting; the --start-minimized / --hidden CLI flag overrides it.
+function shouldStartHidden(settings) {
+  return START_HIDDEN_OVERRIDE || settings.startMinimized === true;
 }
 function isDuplicate(key) {
   const now = Date.now();
@@ -281,10 +342,13 @@ function createWindow () {
 
   // Show when ready to reduce visual flicker
   const settings = loadSettings();
+  const startHidden = shouldStartHidden(settings);
   mainWindow.once('ready-to-show', () => {
     perfLog('ready-to-show');
-    if (settings.startMinimized) {
+    if (startHidden) {
+      // Start minimized (or --start-minimized): stay in the tray.
       mainWindow.hide();
+      console.log('Starting hidden to tray (start minimized)');
     } else {
       mainWindow.show();
       mainWindow.focus();
@@ -439,8 +503,8 @@ function createWindow () {
 
 function createSettingsWindow () {
   const settingsWindow = new BrowserWindow({
-    width: 500,
-    height: 420,
+    width: 560,
+    height: 640,
     resizable: false,
     minimizable: false,
     maximizable: false,
@@ -474,12 +538,12 @@ ipcMain.handle('set-settings', (event, settings) => {
 });
 
 function applySettings(s) {
-  // Apply close-to-tray immediately
-  // Apply notification toggle immediately (handled in notification handler via loadSettings)
-  // Apply start minimized for future restarts
-  if (mainWindow && s.startMinimized && mainWindow.isVisible()) {
-    // If already visible and user sets startMinimized, don't hide immediately
-  }
+  // Start with system: applied immediately via the XDG autostart entry.
+  setStartWithSystem(s.startWithSystem === true);
+  // closeToTray / notificationsEnabled / notificationPreview are re-read from
+  // disk at each use (window close handler, notification handler), so they
+  // apply immediately too.
+  // startMinimized only affects the NEXT launch (hidden on startup).
   console.log('Settings applied:', s);
 }
 
@@ -564,10 +628,16 @@ app.on('before-quit', () => {
   console.log('WhatsApp for Linux shutting down');
 });
 
-// M8: export internals for the mocked-Electron test harness
-// (test/m7-lifecycle.test.js). Electron ignores main-process exports.
+// M8/M9: export internals for the mocked-Electron test harness
+// (test/m7-lifecycle.test.js, test/m9-linux-integration.test.js).
+// Electron ignores main-process exports.
 module.exports = {
   __perfStartMs: PERF_START_MS,
   __perfEvents: PERF_EVENTS,
-  __uiReadyProbe: UI_READY_PROBE
+  __uiReadyProbe: UI_READY_PROBE,
+  __startHiddenOverride: START_HIDDEN_OVERRIDE,
+  __shouldStartHidden: shouldStartHidden,
+  __getAutostartDesktopPath: getAutostartDesktopPath,
+  __getAutostartExec: getAutostartExec,
+  __setStartWithSystem: setStartWithSystem
 };
