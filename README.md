@@ -220,82 +220,68 @@ This requires a real Linux desktop session (display + Electron binary), which is
 not available in the Arena sandbox — see Known Issues. **Report the numbers
 before optimising anything.**
 
-## M9 bugfix — Linux notification click + dismissal (real desktop)
+## M9 bugfix — Linux notification click (real desktop, root cause)
 
-The mocked M9 tests passed but did not exercise the real libnotify / GNOME
-(Desktop Notifications) path, so two Linux-specific defects slipped through:
+### Symptom
+On Ubuntu GNOME/Wayland, `dbus-monitor` showed GNOME Shell doing everything
+right on a banner click — `ActivationToken`, `ActionInvoked (id, "default")`,
+`NotificationClosed (id, 2)` — yet the packaged app never logged
+`[notif] click -> restore/focus window` and the window did not come back.
 
-1. **Click did not restore/focus the window.** Electron's `Notification` JS
-   object is only a weak handle to the native libnotify notification. The
-   previous code created the notification as a local `const` held only by the
-   ~5 s auto-dismiss `setTimeout` closure; once that closure was released the
-   object became garbage, Electron cleared the native delegate, and the `click`
-   event could no longer reach `showAndFocusMainWindow()`. This is the
-   canonical "Linux notification click does nothing" failure.
-2. **The banner did not reliably auto-dismiss.** The banner's visual lifetime
-   is owned by the notification daemon. Electron's Linux Notification API has
-   no per-notification millisecond timeout — `timeoutType` only accepts
-   `'default'` (the daemon's own expiry) or `'never'` — so the ~5 s window can
-   only be enforced with `notification.close()` on a timer, which maps to
-   libnotify's `notify_notification_close()` (a `CloseNotification` DBus
-   request). Without a stable reference to the wrapper, this dismissal request
-   and its `close` event were not observable.
+### Root cause (verified against the Electron v44.3.0 sources)
+1. **`webContents` has no `'notification'` event.** The previous
+   `mainWindow.webContents.on('notification', ...)` handler was dead code: it
+   is not emitted anywhere in `shell/browser/api/electron_api_web_contents.cc`,
+   `lib/browser/api/web-contents.ts`, or documented in `web-contents.md`. As a
+   result the main process **never** constructed a `Notification`, so none of
+   the `[notif]` lines could ever appear — not just the click line.
+2. **The banners were WhatsApp Web's own `new Notification()`**, rendered by
+   Chromium's `PlatformNotificationService`. Electron's Linux bridge
+   (`libnotify_notification.cc`) adds the `"default"` action, forwards the
+   activation token and handles `ActionInvoked` correctly — but
+   `NotificationDelegateImpl::NotificationClick()` dispatches the click **to
+   the renderer** (the page's `onclick`), never to the main process. WhatsApp
+   Web then calls `window.focus()`, which reaches
+   `WebContents::ActivateContents` → `BrowserWindow::OnActivateContents`; that
+   only hides an auto-hide menu bar and does not restore a hidden window.
+3. The earlier "GC / weak reference" theory was wrong: a JS `Notification`
+   object that is never created cannot be garbage collected. The
+   `activeNotifications` retention is harmless and is kept.
+4. The mocked tests fabricated the non-existent `'notification'` event, which
+   is why they passed.
+
+`timeoutType: 'default'`, the icon, `desktop-entry`, actions and other
+notification options have no effect on click delivery.
 
 ### Fix
-- Every live notification is now retained in a module-level
-  `activeNotifications` set (released on click / daemon `close` / `failed`), so
-  the wrapper — and its `click` delivery — survives garbage collection for the
-  banner's whole visible lifetime.
-- Notification construction/show/click/close, the auto-dismiss timer, and the
-  `close`/`show`/`failed` events are logged with a `[notif]` prefix so the real
-  packaged-desktop path can be traced (`grep '[notif]'`).
-- `timeoutType: 'default'` is set explicitly and the Linux-only timeout
-  limitation is documented in `src/main.js`.
-- Unread counting, dedup, focused-app suppression, close-to-tray, and tray
-  behaviour are unchanged.
+There is no main-process API that observes web-page notifications, so the
+only correct route is a **main-world `window.Notification` shim** installed by
+`src/preload.js` (via `webFrame.executeJavaScript`, `contextIsolation` stays
+on). The shim forwards `{ title, body, tag }` on the one-way
+`wa-web-notification` IPC channel and returns an inert stub; `Notification.
+permission` / `requestPermission` are delegated to the real implementation so
+WhatsApp Web's own settings UI keeps working. WhatsApp Web's code is not
+modified, no DOM selectors or CSS are touched.
+
+In `src/main.js`, `handleWebNotification()` receives that IPC (sender-checked
+to the main window) and runs the **unchanged** policy: focused-app
+suppression, dedup, unread counting, the settings toggles, then
+`showNativeNotification()` — whose `click` event now genuinely reaches JS and
+calls `showAndFocusMainWindow()`. Auto-dismiss, tray behaviour and single
+instance are untouched.
 
 ### Manual verification (real Ubuntu Wayland desktop)
-Mocked Electron events cannot prove libnotify click delivery — verify the
-**packaged DEB** on the actual desktop:
-
 ```bash
-# 0. Build + install the DEB (see "Build"), then launch from the app grid.
-#    To capture the [notif] trace, run the installed binary in a terminal:
 /opt/WhatsApp\ for\ Linux/whatsapp-linux 2>&1 | tee /tmp/whatsapp-notif.log
-
-# 1. Send yourself a message from another device/account and keep the
-#    WhatsApp window hidden to the tray (or unfocused).
-#    Expected log (grep it while the banner is up):
+# 1. Hide the window to the tray and send yourself a message. Expected:
 grep '\[notif\]' /tmp/whatsapp-notif.log
-#    constructing <title>
-#    calling show() <title>
-#    show event (banner visible) <title>
-#    scheduling auto-dismiss in 5000ms <title>
-#    auto-dismiss timer fired <title>
-#    dismissing (auto-dismiss timeout) <title>
-
-# 2. Click the banner while it is visible (do NOT move the cursor over it
-#    first). Expected: the window restores + focuses, and the log shows
+#    constructing <title> / calling show() / show event / scheduling auto-dismiss ...
+# 2. Click the banner. Expected: window restored + focused and
 #    click -> restore/focus window <title>
-
-# 3. Confirm the banner disappears on its own after ~5 s without any pointer
-#    interaction over it (the [notif] trace should show the timer firing).
-
-# 4. Confirm the daemon also reports the dismissal via D-Bus (optional,
-#    proves the native CloseNotification path):
-dbus-monitor --session "interface='org.freedesktop.Notifications'"
-#    ... Method Call Notify ... ActionInvoked (on click) ... CloseNotification
-
-# 5. Regression checks: dedup (two identical messages -> one banner), focused
-#    app -> no banner + no unread bump, disabled banners -> unread still
-#    tracked, tray reopen -> unread cleared, close-to-tray still hides.
+# 3. dbus-monitor --session "interface='org.freedesktop.Notifications'"
+#    now shows the Notify call coming from OUR notification (app_name
+#    "whatsapp-linux", hint desktop-entry) followed by ActionInvoked "default".
 ```
-
-Expected result: clicking the banner fires `click` and the window is restored
-and focused; the banner auto-dismisses after ~5 s. If the window is still not
-raised on click even though `click -> restore/focus window` is logged, that is
-a Wayland compositor focus rule (focus-stealing prevention / activation token)
-rather than a notification-delivery issue — see "Known Issues / Limitations".
 
 ## Directory Structure
 ```

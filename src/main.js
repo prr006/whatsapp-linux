@@ -129,8 +129,8 @@ function dismissNotification(nativeNotif, title, reason) {
 }
 
 // Create, show, auto-dismiss and wire up a single native notification.
-// Extracted from the `webContents.on('notification')` handler so the lifecycle
-// can be exercised directly by the regression tests.
+// Called from handleWebNotification(); kept separate so the lifecycle can be
+// exercised directly by the regression tests.
 function showNativeNotification(title, body) {
   notifLog('constructing', title);
   const nativeNotif = new Notification({
@@ -183,6 +183,69 @@ function showNativeNotification(title, body) {
 
   return nativeNotif;
 }
+
+// M9 bugfix: single entry point for a notification raised by WhatsApp Web.
+//
+// ROOT CAUSE (Electron 44.3.0, verified against upstream sources):
+//   * `webContents` emits NO 'notification' event, so the former
+//     `mainWindow.webContents.on('notification', ...)` handler was dead code:
+//     no main-process Notification was ever constructed and no `[notif]` line
+//     could ever be logged.
+//   * The banners the user saw were WhatsApp Web's own `new Notification()`
+//     rendered by Chromium's PlatformNotificationService. GNOME did emit
+//     ActionInvoked "default" for them and Electron's libnotify bridge handled
+//     it correctly — but NotificationDelegateImpl::NotificationClick() delivers
+//     that click to the RENDERER (the page's onclick), not to the main
+//     process, and the page's window.focus() does not restore a hidden
+//     BrowserWindow (WebContents::ActivateContents only hides an auto-hide
+//     menu bar).
+//
+// FIX: src/preload.js installs a main-world `window.Notification` shim that
+// forwards {title, body} over IPC to this function, which runs the SAME
+// policy as before (focused-suppression, dedup, unread, settings toggles) and
+// then shows OUR native Notification whose `click` event reaches JS here and
+// restores/focuses the window.
+const WEB_NOTIFICATION_CHANNEL = 'wa-web-notification';
+
+function handleWebNotification(notification) {
+  // User is already looking at the app: no banner, no unread bump.
+  if (isMainWindowFocused()) {
+    return;
+  }
+
+  const title = (notification && notification.title) || 'WhatsApp';
+  const body = (notification && notification.body) || '';
+
+  // Dedup key: title + first 50 chars of body.
+  const dedupKey = title + '|' + body.substring(0, 50);
+  if (isDuplicate(dedupKey)) {
+    console.log('Notification suppressed (duplicate):', title);
+    return;
+  }
+
+  // Count as unread regardless of the notification toggle (keeps M2/M3
+  // tray badge/tooltip behaviour intact even when banners are disabled).
+  unreadCount++;
+  updateUnreadIndicator();
+
+  const s = loadSettings();
+  if (!s.notificationsEnabled) {
+    console.log('Notification suppressed (disabled by setting):', title, '| unread=', unreadCount);
+    return;
+  }
+
+  showNativeNotification(title, s.notificationPreview ? body : '');
+  console.log('Native notification shown:', title, '| unread=', unreadCount);
+}
+
+// Only accept notifications from the WhatsApp Web window itself (the settings
+// window has a different preload and never sends on this channel).
+ipcMain.on(WEB_NOTIFICATION_CHANNEL, (event, payload) => {
+  if (!mainWindow || mainWindow.isDestroyed() || event.sender !== mainWindow.webContents) {
+    return;
+  }
+  handleWebNotification(payload || {});
+});
 
 // M7: set true once the app is genuinely quitting so the close-to-tray handler
 // does not intercept the final window close (which would abort the quit).
@@ -413,6 +476,10 @@ function createWindow () {
       contextIsolation: true,
       allowRunningInsecureContent: false,
       webSecurity: true,
+      // M9 bugfix: preload installs the main-world `window.Notification`
+      // shim that forwards WhatsApp Web's notifications to the main process
+      // (see src/preload.js and handleWebNotification above).
+      preload: path.join(__dirname, 'preload.js'),
       // Preserve session data (cookies, localStorage, IndexedDB)
       partition: 'persist:whatsapp-linux'
     },
@@ -505,48 +572,10 @@ function createWindow () {
     startFirstUIReadyProbe();
   });
 
-  // M7: Native Linux desktop notifications via Electron Notification API.
-  // We listen to WhatsApp Web's standard web Notification events and replace
-  // them with controlled native notifications so they:
-  //   - only appear when the user is NOT already looking at the chat,
-  //   - auto-dismiss after a short bounded time (NOTIFICATION_TIMEOUT_MS),
-  //   - restore/focus the SAME window on click (single-instance guarantees no
-  //     second process is created),
-  //   - are deduplicated (isDuplicate), and
-  //   - are removed after a click (nativeNotif.close()).
-  mainWindow.webContents.on('notification', (event, notification) => {
-    // Prevent Chromium's own rendering of the web notification (avoid duplicates).
-    event.preventDefault();
-
-    // User is already looking at the app: no banner, no unread bump.
-    if (isMainWindowFocused()) {
-      return;
-    }
-
-    const title = notification.title || 'WhatsApp';
-    const body = notification.body || '';
-
-    // Dedup key: title + first 50 chars of body.
-    const dedupKey = title + '|' + body.substring(0, 50);
-    if (isDuplicate(dedupKey)) {
-      console.log('Notification suppressed (duplicate):', title);
-      return;
-    }
-
-    // Count as unread regardless of the notification toggle (keeps M2/M3
-    // tray badge/tooltip behaviour intact even when banners are disabled).
-    unreadCount++;
-    updateUnreadIndicator();
-
-    const s = loadSettings();
-    if (!s.notificationsEnabled) {
-      console.log('Notification suppressed (disabled by setting):', title, '| unread=', unreadCount);
-      return;
-    }
-
-    showNativeNotification(title, s.notificationPreview ? body : '');
-    console.log('Native notification shown:', title, '| unread=', unreadCount);
-  });
+  // M7/M9: WhatsApp Web's notifications are routed to handleWebNotification()
+  // via the WEB_NOTIFICATION_CHANNEL IPC (registered once at module scope,
+  // see handleWebNotification above). Electron's webContents has no 'notification' event — the
+  // previous `webContents.on('notification', ...)` handler never fired.
 
   // M3: reset unread when user returns to app
   mainWindow.on('focus', () => {

@@ -34,7 +34,7 @@ const electronMock = {
   __mainWindow: null,
   __notifications: [],
   __trayTooltip: null,
-  __notificationHandler: null,
+  __ipcListeners: {},
   __ipcHandlers: {},
 };
 
@@ -51,7 +51,6 @@ class MockBrowserWindow {
       __handlers: {},
       on: (ev, cb) => {
         wc.__handlers[ev] = (wc.__handlers[ev] || []).concat([cb]);
-        if (ev === 'notification') electronMock.__notificationHandler = cb;
       },
       __emit: (ev, ...args) => {
         (wc.__handlers[ev] || []).slice().forEach((cb) => cb(...args));
@@ -132,6 +131,7 @@ electronMock.Menu = { buildFromTemplate(t) { return t; } };
 electronMock.Notification = MockNotification;
 electronMock.ipcMain = {
   handle(channel, fn) { electronMock.__ipcHandlers[channel] = fn; },
+  on(channel, fn) { electronMock.__ipcListeners[channel] = fn; },
 };
 electronMock.nativeImage = {
   createFromPath: () => ({ isEmpty: () => false }),
@@ -161,7 +161,10 @@ before(async () => {
   await new Promise((r) => setImmediate(r));
   win = electronMock.__mainWindow;
   assert.ok(win, 'main window created');
-  assert.ok(electronMock.__notificationHandler, 'notification handler registered');
+  assert.ok(electronMock.__ipcListeners['wa-web-notification'],
+    'wa-web-notification IPC listener registered (real Electron entry point)');
+  assert.ok(win.opts.webPreferences && /preload\.js$/.test(win.opts.webPreferences.preload),
+    'main window loads src/preload.js (installs the Notification shim)');
 });
 
 after(() => {
@@ -170,13 +173,15 @@ after(() => {
   try { fs.rmSync(appDataDir, { recursive: true, force: true }); } catch {}
 });
 
-function fireNotification(title, body) {
-  let prevented = false;
-  electronMock.__notificationHandler(
-    { preventDefault: () => { prevented = true; } },
-    { title, body }
+// Drive the REAL entry point: the 'wa-web-notification' IPC message that
+// src/preload.js sends from its main-world `window.Notification` shim.
+// (Electron's webContents has no 'notification' event — the old harness
+// fabricated one and masked the bug.)
+function fireNotification(title, body, sender) {
+  electronMock.__ipcListeners['wa-web-notification'](
+    { sender: sender || win.webContents },
+    { title, body, tag: '' }
   );
-  assert.ok(prevented, 'web notification default must be prevented');
 }
 
 // Reset the shared notification state (banner list, window hidden/unfocused,
@@ -248,7 +253,7 @@ test('start minimized: --start-minimized flag overrides the setting', () => {
        dialog: {},
        shell: { openExternal() {} },
        Notification: class {},
-       ipcMain: { handle() {} },
+       ipcMain: { handle() {}, on() {} },
        nativeImage: {
          createFromPath: () => ({ isEmpty: () => false }),
          createFromBuffer: () => ({ isEmpty: () => false }),
@@ -476,4 +481,97 @@ test('notification (bugfix): Linux options use timeoutType default (no per-notif
   const n = electronMock.__notifications[0];
   assert.strictEqual(n.opts.timeoutType, 'default',
     'Electron Linux only supports default/never; the ~5s window is enforced via close()');
+});
+
+// ---- M9 root-cause regression: real delivery path ---------------------------
+//
+// The banners on the real desktop were WhatsApp Web's OWN `new Notification()`
+// rendered by Chromium; Electron delivers their click to the renderer, not to
+// the main process, and `webContents` has no 'notification' event. The fix is
+// a main-world `window.Notification` shim in src/preload.js that forwards to
+// the 'wa-web-notification' IPC channel. These tests pin both halves.
+
+test('notification (root cause): main.js does NOT rely on a webContents "notification" event', () => {
+  // Strip comments so the check applies to executable code only.
+  const src = fs.readFileSync(MAIN_JS, 'utf8')
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/^\s*\/\/.*$/gm, '');
+  assert.ok(!/webContents\.on\(\s*['"]notification['"]/.test(src),
+    "webContents has no 'notification' event in Electron 44 — handler would be dead code");
+  assert.ok(/ipcMain\.on\(\s*WEB_NOTIFICATION_CHANNEL/.test(src),
+    'notifications must arrive over the wa-web-notification IPC channel');
+});
+
+test('notification (root cause): IPC from a foreign sender is ignored', () => {
+  resetState();
+  const main = require(MAIN_JS);
+  fireNotification('Mallory', 'not from the WhatsApp window', { id: 'other-webcontents' });
+  assert.strictEqual(electronMock.__notifications.length, 0, 'no banner for foreign sender');
+  assert.strictEqual(main.__activeNotifications.size, 0);
+  assert.notStrictEqual(electronMock.__trayTooltip, 'WhatsApp — 1 unread', 'no unread bump for foreign sender');
+});
+
+test('notification (root cause): preload shim intercepts window.Notification and forwards title/body over IPC', () => {
+  const vm = require('vm');
+  const preloadSrc = fs.readFileSync(path.join(__dirname, '..', 'src', 'preload.js'), 'utf8');
+
+  // Fake page world.
+  const sent = [];
+  const exposed = {};
+  class FakeNativeNotification {
+    constructor() { throw new Error('native Notification must NOT be constructed'); }
+    static get permission() { return 'granted'; }
+    static requestPermission() { return Promise.resolve('granted'); }
+    static get maxActions() { return 2; }
+  }
+  const pageWindow = { Notification: FakeNativeNotification, setTimeout: (fn) => fn() };
+  pageWindow.window = pageWindow;
+  pageWindow.Event = class { constructor(type) { this.type = type; } };
+  const pageCtx = vm.createContext(pageWindow);
+
+  // Fake isolated (preload) world with the electron renderer modules.
+  const electronRenderer = {
+    contextBridge: {
+      exposeInMainWorld(name, value) {
+        exposed[name] = value;
+        pageWindow[name] = value; // what contextBridge does for the page
+      }
+    },
+    ipcRenderer: { send(channel, payload) { sent.push({ channel, payload }); } },
+    webFrame: { executeJavaScript(code) { return vm.runInContext(code, pageCtx); } }
+  };
+  const m = new Module(path.join(__dirname, '..', 'src', 'preload.js'));
+  m.filename = m.id;
+  m.paths = [];
+  const origLoad = Module._load;
+  Module._load = function (req, ...rest) {
+    if (req === 'electron') return electronRenderer;
+    return origLoad.call(this, req, ...rest);
+  };
+  try {
+    m._compile(preloadSrc, m.id);
+  } finally {
+    Module._load = origLoad;
+  }
+
+  assert.strictEqual(typeof exposed.__whatsappLinuxNotify, 'function', 'bridge function exposed');
+  assert.notStrictEqual(pageWindow.Notification, FakeNativeNotification, 'Notification global replaced');
+  assert.strictEqual(pageWindow.Notification.__whatsappLinuxShim, true);
+  assert.strictEqual(pageWindow.Notification.permission, 'granted', 'permission delegated to native');
+
+  // What WhatsApp Web does:
+  const n = vm.runInContext(
+    "new Notification('Alice', { body: 'hello from the page', tag: 'chat-1' })", pageCtx);
+  assert.strictEqual(sent.length, 1, 'exactly one IPC message');
+  assert.deepStrictEqual(sent[0], {
+    channel: 'wa-web-notification',
+    payload: { title: 'Alice', body: 'hello from the page', tag: 'chat-1' }
+  });
+  assert.strictEqual(typeof n.close, 'function', 'stub keeps the Notification surface');
+  n.close();
+
+  // Bad input must never throw into the page.
+  vm.runInContext("new Notification(undefined, { body: 42 })", pageCtx);
+  assert.strictEqual(sent[1].payload.title, '');
+  assert.strictEqual(sent[1].payload.body, '');
 });
