@@ -454,8 +454,21 @@ function showNativeNotification(title, body, eventRecord) {
     recordLifecycle(eventId, 'click',
       'click-triggered close; GNOME also auto-removes non-resident notifications on activation');
     markNotificationRead(eventId, 'native click');
+    const targetChat = (eventRecord && (eventRecord.chatId || extractChatIdFromTag(eventRecord.tag) || eventRecord.tag)) || null;
+    if (targetChat) {
+      markChatRead(targetChat, 'native click');
+    }
     dismissNotification(nativeNotif, eventId, 'click');
     showAndFocusMainWindow();
+    if (mainWindow && !mainWindow.isDestroyed() && mainWindow.webContents && typeof mainWindow.webContents.send === 'function') {
+      mainWindow.webContents.send('wa-notification-click', {
+        eventId: eventId,
+        chatId: targetChat,
+        messageId: (eventRecord && eventRecord.messageId) || null,
+        tag: (eventRecord && eventRecord.tag) || tag || '',
+        rendererId: eventId
+      });
+    }
   });
 
   // 'close' is emitted when the daemon reports NotificationClosed for this
@@ -561,6 +574,23 @@ function showNativeNotification(title, body, eventRecord) {
 // then shows OUR native Notification whose `click` event reaches JS here and
 // restores/focuses the window.
 const WEB_NOTIFICATION_CHANNEL = 'wa-web-notification';
+const WEB_READ_STATE_CHANNEL = 'wa-read-state';
+
+function extractChatIdFromTag(tag) {
+  if (typeof tag !== 'string' || !tag.trim()) return null;
+  let clean = tag.trim();
+  clean = clean.replace(/^chat[:_]/i, '');
+  const jidMatch = clean.match(/([0-9a-zA-Z._-]+@(c\.us|g\.us|s\.whatsapp\.net|lid|newsletter|broadcast))/i);
+  if (jidMatch) return jidMatch[1];
+  return clean;
+}
+
+function normalizeChatId(id) {
+  if (typeof id !== 'string') return '';
+  let clean = id.trim().toLowerCase();
+  clean = clean.replace(/^chat[:_]/i, '');
+  return clean;
+}
 
 function pruneNotificationEvents() {
   if (notificationEvents.size <= MAX_EVENT_RECORDS) return;
@@ -569,15 +599,62 @@ function pruneNotificationEvents() {
   }
 }
 
+function recomputeUnreadCount(reason) {
+  let count = 0;
+  for (const record of notificationEvents.values()) {
+    if (!record.read) {
+      count++;
+    }
+  }
+  unreadCount = Math.max(0, count);
+  updateUnreadIndicator(reason + ' (unread=' + unreadCount + ')');
+  pruneNotificationEvents();
+  return unreadCount;
+}
+
 function markNotificationRead(id, reason) {
   const record = notificationEvents.get(id);
   if (!record || record.read) return false;
   record.read = true;
-  unreadCount = Math.max(0, unreadCount - 1);
+  recomputeUnreadCount(reason);
   notifLog('unread transition id=' + id + ' -> read (' + reason + '), count=' + unreadCount);
-  updateUnreadIndicator(reason + ' (unread=' + unreadCount + ')');
-  pruneNotificationEvents();
   return true;
+}
+
+function markChatRead(chatId, reason, messageId) {
+  if (!chatId && !messageId) return false;
+  const normTarget = chatId ? normalizeChatId(chatId) : null;
+  let changed = false;
+
+  for (const record of notificationEvents.values()) {
+    if (record.read) continue;
+    let match = false;
+    if (normTarget) {
+      if (normTarget === '*' || normTarget === '__all__') {
+        match = true;
+      } else if (record.chatId && normalizeChatId(record.chatId) === normTarget) {
+        match = true;
+      } else if (record.tag && normalizeChatId(record.tag) === normTarget) {
+        match = true;
+      }
+    }
+    if (!match && messageId && record.messageIds && record.messageIds.includes(messageId)) {
+      match = true;
+    }
+
+    if (match) {
+      record.read = true;
+      changed = true;
+      notifLog('record marked read id=' + record.id + ' chat=' + (record.chatId || record.tag) +
+        ' (' + (reason || 'chat read') + ')');
+    }
+  }
+
+  if (changed) {
+    recomputeUnreadCount(reason || 'chat read');
+    return true;
+  }
+  return false;
 }
 
 function handleRendererNotificationClose(notification) {
@@ -594,10 +671,22 @@ function handleRendererNotificationClose(notification) {
   markNotificationRead(id, 'renderer close');
 }
 
+function handleRendererChatRead(payload) {
+  const chatId = payload && typeof payload.chatId === 'string' ? payload.chatId : (payload && payload.tag ? payload.tag : '');
+  const messageId = payload && typeof payload.messageId === 'string' ? payload.messageId : '';
+  const reason = payload && typeof payload.reason === 'string' ? payload.reason : 'whatsapp read';
+  notifLog('chat read event received chatId=' + chatId + (messageId ? ' messageId=' + messageId : '') + ' (' + reason + ')');
+  markChatRead(chatId, reason, messageId);
+}
+
 function handleWebNotification(notification) {
   const lifecycle = notification && notification.lifecycle ? notification.lifecycle : 'constructor';
   if (lifecycle === 'close') {
     handleRendererNotificationClose(notification);
+    return;
+  }
+  if (lifecycle === 'chat-read' || lifecycle === 'read') {
+    handleRendererChatRead(notification);
     return;
   }
 
@@ -610,6 +699,17 @@ function handleWebNotification(notification) {
   const rendererId = notification && typeof notification.eventId === 'string'
     ? notification.eventId : '';
   const tag = notification && typeof notification.tag === 'string' ? notification.tag : '';
+  const chatId = (notification && typeof notification.chatId === 'string' && notification.chatId) ||
+    (notification && notification.data && typeof notification.data.chatId === 'string' && notification.data.chatId) ||
+    extractChatIdFromTag(tag) || null;
+  const messageId = (notification && typeof notification.messageId === 'string' && notification.messageId) ||
+    (notification && notification.data && typeof notification.data.messageId === 'string' && notification.data.messageId) || null;
+  const messageIds = Array.isArray(notification && notification.messageIds)
+    ? notification.messageIds
+    : (messageId ? [messageId] : []);
+  const timestamp = typeof (notification && notification.timestamp) === 'number'
+    ? notification.timestamp
+    : Date.now();
 
   // Only an explicitly repeated renderer event is a proven duplicate. The
   // legacy no-ID path retains M11 compatibility; it is intentionally not used
@@ -630,10 +730,23 @@ function handleWebNotification(notification) {
   }
 
   const id = rendererId || 'fallback-' + (++nextFallbackNotificationId);
-  const record = { id: id, tag: tag, title: title, read: false, native: null, hasRendererId: !!rendererId };
+  const record = {
+    id: id,
+    rendererId: rendererId,
+    tag: tag,
+    chatId: chatId,
+    messageIds: messageIds,
+    timestamp: timestamp,
+    title: title,
+    body: body,
+    read: false,
+    native: null,
+    hasRendererId: !!rendererId
+  };
   notificationEvents.set(id, record);
   unreadCount++;
   notifLog('renderer event received id=' + id + (tag ? ' tag=' + tag : '') +
+    (chatId ? ' chatId=' + chatId : '') +
     ', unread transition -> ' + unreadCount);
   updateUnreadIndicator('message received (unread=' + unreadCount + ')');
 
@@ -654,6 +767,13 @@ ipcMain.on(WEB_NOTIFICATION_CHANNEL, (event, payload) => {
     return;
   }
   handleWebNotification(payload || {});
+});
+
+ipcMain.on(WEB_READ_STATE_CHANNEL, (event, payload) => {
+  if (!mainWindow || mainWindow.isDestroyed() || event.sender !== mainWindow.webContents) {
+    return;
+  }
+  handleRendererChatRead(payload || {});
 });
 
 // M7: set true once the app is genuinely quitting so the close-to-tray handler
@@ -1141,8 +1261,7 @@ function createWindow () {
       }
     }
     if (changed) {
-      unreadCount = 0;
-      updateUnreadIndicator(reason);
+      recomputeUnreadCount(reason);
       badgeLog('legacy unread cleared by', reason);
     }
   }
@@ -1321,5 +1440,13 @@ module.exports = {
   __dockBadgeSupported: dockBadgeSupported,
   __pushDockBadge: pushDockBadge,
   __updateDockBadge: updateDockBadge,
-  __getUnreadCount: () => unreadCount
+  __getUnreadCount: () => unreadCount,
+  // M15: read-state synchronization
+  __seenRendererEvents: seenRendererEvents,
+  __markChatRead: markChatRead,
+  __recomputeUnreadCount: recomputeUnreadCount,
+  __handleRendererChatRead: handleRendererChatRead,
+  __handleWebNotification: handleWebNotification,
+  __normalizeChatId: normalizeChatId,
+  __extractChatIdFromTag: extractChatIdFromTag
 };

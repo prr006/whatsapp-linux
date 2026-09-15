@@ -646,6 +646,32 @@ Useful extra dials while diagnosing on the real desktop:
 (a lingering banner shows NO `CloseNotification`/`NotificationClosed`
 traffic — the giveaway that GNOME's idle/hover policy is holding it).
 
+## M15 — WhatsApp Web Read-State Synchronization
+
+### Problem & Requirements
+Previously, unread counts only cleared when a native notification was clicked or when legacy notifications were cleared on window focus. However:
+1. When a user reads a chat directly inside WhatsApp Web (e.g. In the chat window or on another synchronized device), the desktop dock badge and tray counter remained stale.
+2. Merely focusing the window or restoring from tray must **not** clear unread state — only actually reading the messages should mark them as read.
+3. Multiple chats and messages must maintain independent unread status (e.g. Chat A + Chat B = 2 unread; reading Chat A leaves 1 unread for Chat B; reading Chat B leaves 0).
+4. Clicking a native notification must restore and focus WhatsApp, navigate WhatsApp Web to the originating chat, trigger normal WhatsApp read semantics, and clear only that chat's notification records without clearing unrelated chats.
+5. Message identity is decoupled from title/body and tag; multiple messages with identical title/body are tracked independently.
+
+### Architecture
+- **Renderer Preload (`src/preload.js`)**:
+  - `ShimNotification`: Captures `chatId` and `messageId` from `tag` and `data` options and forwards them via non-enumerable properties over IPC.
+  - Active notification registry: Maintains a map of `eventId` to active `ShimNotification` instances.
+  - Chat read detection:
+    1. Intercepts IndexedDB writes on the `chat` object store for records updating `unreadCount` to 0.
+    2. Hooks internal WhatsApp modules (`WAWebUpdateUnreadChatAction.sendSeen` and `WAWebCollections.Chat` `change:unreadCount`) when available.
+    3. Dispatches `wa-read-state` IPC with `{ chatId, unreadCount, reason }` to the main process.
+  - Click navigation bridge: Listens for `wa-notification-click` IPC from the main process, invokes `shim.onclick`, and drives WhatsApp's `Cmd.openChatBottom` / `openChatAt` to open the target chat.
+- **Main Process (`src/main.js`)**:
+  - `notificationEvents`: Tracks notification events with `chatId`, `messageIds`, and `read` status.
+  - Dynamic count recalculation (`recomputeUnreadCount`): Dynamically counts unread records across the map and synchronizes with `updateDockBadge` and `tray.setToolTip`.
+  - Chat read handler (`markChatRead` / `handleRendererChatRead`): Clears records matching the target `chatId` (case-insensitively, supporting jid formats like `@c.us`, `@g.us`, `@lid`, etc.), leaving other chats untouched.
+  - Click routing: Restores/focuses the window, dismisses the native notification, marks only the clicked chat as read, and sends `wa-notification-click` to the renderer.
+  - Focus and tray restore safety: `clearLegacyUnread` only applies to legacy notifications without renderer IDs; shim-correlated notifications are never cleared by focus, show, or activate events.
+
 ## Directory Structure
 ```
 whatsapp-linux/
@@ -664,7 +690,8 @@ whatsapp-linux/
 │   ├── m11-dock-badge.test.js      # M11 dock badge state transitions + desktop identity
 │   ├── m11-dock-badge-no-tray.test.js # M11 badge survives a tray-init failure
 │   ├── m12-notification-contract.test.js # M12 renderer-event identity + lifecycle contracts
-│   └── m13-banner-lifecycle.test.js # M13 banner expiration/dismissal state machine
+│   ├── m13-banner-lifecycle.test.js # M13 banner expiration/dismissal state machine
+│   └── m15-read-state-sync.test.js  # M15 WhatsApp read-state synchronization
 ├── build/
 │   ├── icons/icon.png  # App icon (AI-generated)
 │   └── whatsapp-linux.desktop
@@ -686,7 +713,7 @@ npm run dist   # AppImage / deb (electron-builder)
 
 ## Test
 ```bash
-npm test       # node --test test/*.test.js — 83 tests, mocked Electron, no display needed
+npm test       # node --test test/*.test.js — 96 tests, mocked Electron, no display needed
 ```
 
 ## Testing Protocol (per instructions)
